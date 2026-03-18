@@ -228,14 +228,6 @@ Audio latent (B, 8, T, 16)
 
 ---
 
-## Hardware Notes
-
-- **Minimum**: 32GB Apple Silicon
-- **Model weights**: ~21GB int8 (dominant cost)
-- Text encoder (Gemma 3 12B, ~8.7GB peak) and transformer (~12.6GB peak) cannot coexist on 32GB — callers should load/unload sequentially
-
----
-
 ## Conventions
 
 - Python 3.11+
