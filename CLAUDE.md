@@ -253,4 +253,4 @@ Audio latent (B, 8, T, 16)
 - **ltx-pipelines**: [GitHub](https://github.com/Lightricks/LTX-2/tree/main/packages/ltx-pipelines)
 - **MLX**: [Docs](https://ml-explore.github.io/mlx/) · [GitHub](https://github.com/ml-explore/mlx)
 - **mlx-forge**: [GitHub](https://github.com/dgrauet/mlx-forge) — weight conversion
-- **Pre-converted weights**: [HuggingFace](https://huggingface.co/dgrauet/ltx-2.3-mlx-distilled-q8)
+- **Pre-converted weights**: [HuggingFace collection](https://huggingface.co/collections/dgrauet/ltx-23)
