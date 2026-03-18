@@ -4,7 +4,7 @@
 
 Pure MLX port of [ltx-core](https://github.com/Lightricks/LTX-2) (Lightricks) for Apple Silicon. Provides the complete LTX-2.3 inference pipeline — transformer, VAE, audio, vocoder, conditioning — as a standalone Python package.
 
-Loads pre-converted MLX weights from [HuggingFace](https://huggingface.co/dgrauet/ltx-2.3-mlx-distilled-q8). Weight conversion is handled by [mlx-forge](https://github.com/dgrauet/mlx-forge).
+Loads pre-converted MLX weights from the [LTX-2.3 MLX collection on HuggingFace](https://huggingface.co/collections/dgrauet/ltx-23-mlx-6839a0ba7d4f9b3e53d22e7c). Weight conversion is handled by [mlx-forge](https://github.com/dgrauet/mlx-forge).
 
 ---
 
