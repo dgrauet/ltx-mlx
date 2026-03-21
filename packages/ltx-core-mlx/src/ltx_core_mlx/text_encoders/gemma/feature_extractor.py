@@ -239,21 +239,28 @@ class GemmaFeaturesExtractorV2(nn.Module):
         Returns:
             Tuple of (video_embeds, audio_embeds).
         """
-        # Per-layer RMS normalization, then concatenate
-        # Reference: norm_and_concat_per_token_rms normalizes each layer's D=3840
-        # features separately, then zeros out padding positions with mask.
+        # Per-token RMS normalization, then stack and reshape.
+        # Reference: torch.stack(hidden_states, dim=-1) → [B, T, D, L]
+        # then RMSNorm over dim=2 (D), then reshape to [B, T, D*L].
+        # This gives D-interleaved order: [d0_l0, d0_l1, ..., d1_l0, ...]
+        # which the projection weights were trained with.
         if self.norm_type == "per_token_rms":
-            normed_states = []
-            for h in all_hidden_states:
-                variance = mx.mean(h * h, axis=-1, keepdims=True)
-                normed_states.append(h * mx.rsqrt(variance + 1e-6))
-            stacked = mx.concatenate(normed_states, axis=-1)
+            # Stack on last axis: [B, T, D, L]
+            encoded = mx.stack(all_hidden_states, axis=-1)
+            # RMSNorm over D dimension (axis=2)
+            variance = mx.mean(encoded * encoded, axis=2, keepdims=True)
+            normed = encoded * mx.rsqrt(variance + 1e-6)
+            # Reshape to [B, T, D*L] — D-interleaved order
+            B, T, D, L = normed.shape
+            stacked = normed.reshape(B, T, D * L)
             # Zero out padding positions
             if attention_mask is not None:
                 mask_3d = attention_mask[:, :, None].astype(stacked.dtype)
                 stacked = stacked * mask_3d
         else:
-            stacked = mx.concatenate(all_hidden_states, axis=-1)
+            stacked = mx.stack(all_hidden_states, axis=-1)
+            B, T, D, L = stacked.shape
+            stacked = stacked.reshape(B, T, D * L)
 
         # Project and refine through connectors
         return self.connector(stacked, attention_mask=attention_mask)
