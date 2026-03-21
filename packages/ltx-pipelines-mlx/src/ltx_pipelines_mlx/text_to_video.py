@@ -119,7 +119,7 @@ class TextToVideoPipeline:
         # Load connector (text embedding projection + refinement)
         self.feature_extractor = GemmaFeaturesExtractorV2()
         connector_weights = load_split_safetensors(model_dir / "connector.safetensors", prefix="connector.")
-        self.feature_extractor.load_weights(list(connector_weights.items()))
+        self.feature_extractor.connector.load_weights(list(connector_weights.items()))
         aggressive_cleanup()
 
         self._loaded = True
