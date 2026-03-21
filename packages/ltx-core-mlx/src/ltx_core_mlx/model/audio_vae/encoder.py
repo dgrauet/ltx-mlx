@@ -95,7 +95,7 @@ class AudioVAEEncoder(nn.Module):
         # Mid
         from ltx_core_mlx.model.audio_vae.audio_vae import AudioMidBlock
 
-        self.mid = AudioMidBlock(512, causal=True)
+        self.mid = AudioMidBlock(512, causal=True, add_attention=False)
 
         # Output: 8 channels (latent C1 dim)
         self.conv_out = WrappedConv2d(512, 8, 3, padding=1, causal=True)

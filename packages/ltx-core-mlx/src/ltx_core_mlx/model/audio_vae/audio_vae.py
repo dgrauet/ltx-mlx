@@ -219,17 +219,21 @@ class AudioUpBlock(nn.Module):
 
 
 class AudioMidBlock(nn.Module):
-    """Mid block: resblock, attention, resblock — keyed as mid.block_1, mid.attn_1, mid.block_2."""
+    """Mid block: resblock, optional attention, resblock.
 
-    def __init__(self, channels: int, causal: bool = False):
+    Keys: mid.block_1, mid.attn_1 (optional), mid.block_2.
+    """
+
+    def __init__(self, channels: int, causal: bool = False, add_attention: bool = False):
         super().__init__()
         self.block_1 = AudioResBlock(channels, causal=causal)
-        self.attn_1 = AudioAttnBlock(channels)
+        self.attn_1 = AudioAttnBlock(channels) if add_attention else None
         self.block_2 = AudioResBlock(channels, causal=causal)
 
     def __call__(self, x: mx.array) -> mx.array:
         x = self.block_1(x)
-        x = self.attn_1(x)
+        if self.attn_1 is not None:
+            x = self.attn_1(x)
         x = self.block_2(x)
         return x
 
@@ -265,17 +269,18 @@ class AudioVAEDecoder(nn.Module):
         # conv_in: 8 input channels (latent C1 dim)
         self.conv_in = WrappedConv2d(8, 512, 3, padding=1, causal=True)
 
-        # Mid
-        self.mid = AudioMidBlock(512, causal=True)
+        # Mid — config: mid_block_add_attention=False for distilled model
+        self.mid = AudioMidBlock(512, causal=True, add_attention=False)
 
         # Up blocks — stored in list indexed [0, 1, 2] but run in REVERSE order
+        # Config: attn_resolutions=[] → no attention in any up block
         # up.0: 256→128, no upsample
         # up.1: 512→256, upsample
         # up.2: 512→512, upsample
         self.up = [
-            AudioUpBlock(256, 128, num_blocks=3, add_upsample=False, add_attention=False, causal=True),  # up.0: freq=64
-            AudioUpBlock(512, 256, num_blocks=3, add_upsample=True, add_attention=True, causal=True),  # up.1: freq=32
-            AudioUpBlock(512, 512, num_blocks=3, add_upsample=True, add_attention=True, causal=True),  # up.2: freq=16
+            AudioUpBlock(256, 128, num_blocks=3, add_upsample=False, add_attention=False, causal=True),
+            AudioUpBlock(512, 256, num_blocks=3, add_upsample=True, add_attention=False, causal=True),
+            AudioUpBlock(512, 512, num_blocks=3, add_upsample=True, add_attention=False, causal=True),
         ]
 
         # Output

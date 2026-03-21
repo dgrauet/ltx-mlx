@@ -97,6 +97,11 @@ class TextToVideoPipeline:
         # Load audio decoder + vocoder
         self.audio_decoder = AudioVAEDecoder()
         audio_weights = load_split_safetensors(model_dir / "audio_vae.safetensors", prefix="audio_vae.decoder.")
+        # Also load per_channel_statistics (not under decoder. prefix)
+        all_audio = load_split_safetensors(model_dir / "audio_vae.safetensors", prefix="audio_vae.")
+        for k, v in all_audio.items():
+            if k.startswith("per_channel_statistics."):
+                audio_weights[k] = v
         audio_weights = remap_audio_vae_keys(audio_weights)
         self.audio_decoder.load_weights(list(audio_weights.items()))
         aggressive_cleanup()
@@ -113,7 +118,7 @@ class TextToVideoPipeline:
 
         # Load connector (text embedding projection + refinement)
         self.feature_extractor = GemmaFeaturesExtractorV2()
-        connector_weights = load_split_safetensors(model_dir / "connector.safetensors")
+        connector_weights = load_split_safetensors(model_dir / "connector.safetensors", prefix="connector.")
         self.feature_extractor.load_weights(list(connector_weights.items()))
         aggressive_cleanup()
 
