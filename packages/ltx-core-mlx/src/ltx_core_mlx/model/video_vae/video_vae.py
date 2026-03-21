@@ -233,13 +233,16 @@ class VideoDecoder(nn.Module):
                 frame = ((frame + 1.0) * 127.5).astype(mx.uint8)
                 # (1, 3, H, W) -> (H, W, 3)
                 frame_hwc = frame[0].transpose(1, 2, 0)
-                mx.async_eval(frame_hwc)
+                mx.eval(frame_hwc)  # must be sync — async_eval can write before data is ready
                 proc.stdin.write(bytes(memoryview(frame_hwc)))
                 del frame, frame_hwc
                 if i % 8 == 0:
                     aggressive_cleanup()
+        except BrokenPipeError:
+            pass  # ffmpeg may close early with -shortest; output is still valid
         finally:
-            proc.stdin.close()
+            if proc.stdin and not proc.stdin.closed:
+                proc.stdin.close()
             proc.wait()
             aggressive_cleanup()
 

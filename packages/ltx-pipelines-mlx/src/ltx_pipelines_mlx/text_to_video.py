@@ -232,6 +232,14 @@ class TextToVideoPipeline:
             num_steps=num_steps,
         )
 
+        # Free transformer + text encoder to make room for VAE decode
+        if self.low_memory:
+            self.dit = None
+            self.text_encoder = None
+            self.feature_extractor = None
+            self._loaded = False
+            aggressive_cleanup()
+
         # Decode audio first (smaller)
         assert self.audio_decoder is not None
         assert self.vocoder is not None
