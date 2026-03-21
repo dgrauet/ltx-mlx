@@ -1,0 +1,284 @@
+"""Text-to-Video pipeline — prompt to video+audio.
+
+Ported from ltx-pipelines/src/ltx_pipelines/text_to_video.py
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+
+import mlx.core as mx
+from huggingface_hub import snapshot_download
+
+from ltx_core_mlx.conditioning.types.latent_cond import create_initial_state
+from ltx_core_mlx.model.audio_vae.audio_vae import AudioVAEDecoder
+from ltx_core_mlx.model.audio_vae.bwe import VocoderWithBWE
+from ltx_core_mlx.model.transformer.model import LTXModel, X0Model
+from ltx_core_mlx.model.video_vae.patchifier import AudioPatchifier, VideoLatentPatchifier, compute_video_latent_shape
+from ltx_core_mlx.model.video_vae.video_vae import VideoDecoder
+from ltx_core_mlx.text_encoders.gemma.feature_extractor import GemmaFeaturesExtractorV2
+from ltx_core_mlx.text_encoders.gemma.language_model import GemmaLanguageModel
+from ltx_core_mlx.utils.memory import aggressive_cleanup
+from ltx_core_mlx.utils.positions import compute_audio_positions, compute_audio_token_count, compute_video_positions
+from ltx_core_mlx.utils.weights import apply_quantization, load_split_safetensors, remap_audio_vae_keys
+from ltx_pipelines_mlx.denoise import denoise_loop
+from ltx_pipelines_mlx.scheduler import DISTILLED_SIGMAS
+
+
+@dataclass
+class GenerationOutput:
+    """Output of a generation pipeline."""
+
+    video_path: str | None = None
+    audio_path: str | None = None
+
+
+class TextToVideoPipeline:
+    """Text-to-Video generation pipeline.
+
+    Generates video+audio from a text prompt using the LTX-2.3 model.
+
+    Args:
+        model_dir: Path to model weights or HuggingFace repo ID.
+        low_memory: If True, aggressively free memory between stages.
+    """
+
+    def __init__(
+        self,
+        model_dir: str,
+        gemma_model_id: str = "mlx-community/gemma-3-12b-it-4bit",
+        low_memory: bool = True,
+    ):
+        self.model_dir = self._resolve_model_dir(model_dir)
+        self._gemma_model_id = gemma_model_id
+        self.low_memory = low_memory
+        self._loaded = False
+
+        # Components (lazy-loaded)
+        self.dit: LTXModel | None = None
+        self.vae_decoder: VideoDecoder | None = None
+        self.audio_decoder: AudioVAEDecoder | None = None
+        self.vocoder: VocoderWithBWE | None = None
+        self.text_encoder: GemmaLanguageModel | None = None
+        self.feature_extractor: GemmaFeaturesExtractorV2 | None = None
+        self.video_patchifier = VideoLatentPatchifier()
+        self.audio_patchifier = AudioPatchifier()
+
+    @staticmethod
+    def _resolve_model_dir(model_dir: str) -> Path:
+        """Resolve model directory — download from HF if needed."""
+        path = Path(model_dir)
+        if path.exists():
+            return path
+        # Try HuggingFace download
+        return Path(snapshot_download(model_dir))
+
+    def load(self) -> None:
+        """Load all model components from disk."""
+        if self._loaded:
+            return
+
+        model_dir = self.model_dir
+
+        # Load DiT
+        self.dit = LTXModel()
+        transformer_weights = load_split_safetensors(model_dir / "transformer.safetensors", prefix="transformer.")
+        apply_quantization(self.dit, transformer_weights)
+        self.dit.load_weights(list(transformer_weights.items()))
+        aggressive_cleanup()
+
+        # Load VAE decoder
+        self.vae_decoder = VideoDecoder()
+        vae_weights = load_split_safetensors(model_dir / "vae_decoder.safetensors", prefix="vae_decoder.")
+        self.vae_decoder.load_weights(list(vae_weights.items()))
+        aggressive_cleanup()
+
+        # Load audio decoder + vocoder
+        self.audio_decoder = AudioVAEDecoder()
+        audio_weights = load_split_safetensors(model_dir / "audio_vae.safetensors", prefix="audio_vae.")
+        audio_weights = remap_audio_vae_keys(audio_weights)
+        self.audio_decoder.load_weights(list(audio_weights.items()))
+        aggressive_cleanup()
+
+        self.vocoder = VocoderWithBWE()
+        vocoder_weights = load_split_safetensors(model_dir / "vocoder.safetensors", prefix="vocoder.")
+        self.vocoder.load_weights(list(vocoder_weights.items()))
+        aggressive_cleanup()
+
+        # Load text encoder (Gemma 3 via mlx-lm)
+        self.text_encoder = GemmaLanguageModel()
+        self.text_encoder.load(self._gemma_model_id)
+        aggressive_cleanup()
+
+        # Load connector (text embedding projection + refinement)
+        self.feature_extractor = GemmaFeaturesExtractorV2()
+        connector_weights = load_split_safetensors(model_dir / "connector.safetensors")
+        self.feature_extractor.load_weights(list(connector_weights.items()))
+        aggressive_cleanup()
+
+        self._loaded = True
+
+    def _encode_text(self, prompt: str) -> tuple[mx.array, mx.array]:
+        """Encode text prompt to video and audio embeddings."""
+        assert self.text_encoder is not None
+        assert self.feature_extractor is not None
+
+        # Extract ALL 49 layer hidden states with attention mask
+        all_hidden_states, attention_mask = self.text_encoder.encode_all_layers(prompt)
+        video_embeds, audio_embeds = self.feature_extractor(all_hidden_states, attention_mask=attention_mask)
+        return video_embeds, audio_embeds
+
+    def generate(
+        self,
+        prompt: str,
+        height: int = 480,
+        width: int = 704,
+        num_frames: int = 97,
+        seed: int = 42,
+        num_steps: int | None = None,
+    ) -> tuple[mx.array, mx.array]:
+        """Generate video and audio latents.
+
+        Args:
+            prompt: Text prompt.
+            height: Video height in pixels.
+            width: Video width in pixels.
+            num_frames: Number of video frames.
+            seed: Random seed.
+            num_steps: Number of denoising steps (defaults to 8).
+
+        Returns:
+            Tuple of (video_latent, audio_latent) in spatial format.
+        """
+        self.load()
+        assert self.dit is not None
+
+        # Compute latent shapes
+        F, H, W = compute_video_latent_shape(num_frames, height, width)
+        video_shape = (1, F * H * W, 128)
+        audio_T = compute_audio_token_count(num_frames)
+        audio_shape = (1, audio_T, 128)
+
+        # Encode text
+        video_embeds, audio_embeds = self._encode_text(prompt)
+        if self.low_memory:
+            aggressive_cleanup()
+
+        # Compute positions for RoPE
+        video_positions = compute_video_positions(F, H, W)
+        audio_positions = compute_audio_positions(audio_T)
+
+        # Create initial noise with positions
+        video_state = create_initial_state(video_shape, seed, positions=video_positions)
+        audio_state = create_initial_state(audio_shape, seed + 1, positions=audio_positions)
+
+        # Denoise
+        sigmas = DISTILLED_SIGMAS[: num_steps + 1] if num_steps else DISTILLED_SIGMAS
+        x0_model = X0Model(self.dit)
+
+        output = denoise_loop(
+            model=x0_model,
+            video_state=video_state,
+            audio_state=audio_state,
+            video_text_embeds=video_embeds,
+            audio_text_embeds=audio_embeds,
+            sigmas=sigmas,
+        )
+        if self.low_memory:
+            aggressive_cleanup()
+
+        # Unpatchify
+        video_latent = self.video_patchifier.unpatchify(output.video_latent, (F, H, W))
+        audio_latent = self.audio_patchifier.unpatchify(output.audio_latent)
+
+        return video_latent, audio_latent
+
+    def generate_and_save(
+        self,
+        prompt: str,
+        output_path: str,
+        height: int = 480,
+        width: int = 704,
+        num_frames: int = 97,
+        seed: int = 42,
+        num_steps: int | None = None,
+    ) -> str:
+        """Generate and save video+audio to file.
+
+        Args:
+            prompt: Text prompt.
+            output_path: Path to output video file.
+            height: Video height.
+            width: Video width.
+            num_frames: Number of frames.
+            seed: Random seed.
+            num_steps: Number of denoising steps.
+
+        Returns:
+            Path to the output video file.
+        """
+        video_latent, audio_latent = self.generate(
+            prompt=prompt,
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            seed=seed,
+            num_steps=num_steps,
+        )
+
+        # Decode audio first (smaller)
+        assert self.audio_decoder is not None
+        assert self.vocoder is not None
+        mel = self.audio_decoder.decode(audio_latent)
+        waveform = self.vocoder(mel)
+        if self.low_memory:
+            aggressive_cleanup()
+
+        # Save audio to temp file
+        import tempfile
+
+        audio_path = tempfile.mktemp(suffix=".wav")
+        self._save_waveform(waveform, audio_path, sample_rate=48000)
+
+        # Decode video and stream to ffmpeg
+        assert self.vae_decoder is not None
+        self.vae_decoder.decode_and_stream(video_latent, output_path, fps=24.0, audio_path=audio_path)
+
+        # Cleanup temp audio
+        Path(audio_path).unlink(missing_ok=True)
+        aggressive_cleanup()
+
+        return output_path
+
+    @staticmethod
+    def _save_waveform(waveform: mx.array, path: str, sample_rate: int = 48000) -> None:
+        """Save waveform to WAV file.
+
+        Args:
+            waveform: (B, C, T) or (B, T) waveform.
+            path: Output path.
+            sample_rate: Sample rate in Hz.
+        """
+        import wave
+
+        import numpy as np
+
+        # Take first batch item
+        wav = waveform[0]
+        if wav.ndim == 2:
+            num_channels = wav.shape[0]
+            wav = wav.T  # (T, C)
+        else:
+            num_channels = 1
+            wav = wav[:, None]  # (T, 1)
+
+        wav_np = np.array(wav, dtype=np.float32)
+        wav_np = np.clip(wav_np, -1.0, 1.0)
+        wav_int16 = (wav_np * 32767).astype(np.int16)
+
+        with wave.open(path, "w") as wf:
+            wf.setnchannels(num_channels)
+            wf.setsampwidth(2)
+            wf.setframerate(sample_rate)
+            wf.writeframes(wav_int16.tobytes())

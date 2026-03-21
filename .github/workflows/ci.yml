@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+      - run: uv venv && uv pip install ruff>=0.7.0
+      - run: .venv/bin/ruff check src/
+      - run: .venv/bin/ruff format --check src/
+
+  test:
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+      - run: uv venv --python ${{ matrix.python-version }} && uv pip install -e ".[dev]"
+      - run: .venv/bin/pytest tests/ -v -m "not slow" --tb=short

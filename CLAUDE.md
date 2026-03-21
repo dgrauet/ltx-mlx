@@ -1,8 +1,11 @@
-# CLAUDE.md — ltx-mlx
+# CLAUDE.md — ltx-2-mlx
 
 ## Project Overview
 
-Pure MLX port of [ltx-core](https://github.com/Lightricks/LTX-2) (Lightricks) for Apple Silicon. Provides the complete LTX-2.3 inference pipeline — transformer, VAE, audio, vocoder, conditioning — as a standalone Python package.
+Pure MLX port of [ltx-core](https://github.com/Lightricks/LTX-2/tree/main/packages/ltx-core) and [ltx-pipelines](https://github.com/Lightricks/LTX-2/tree/main/packages/ltx-pipelines) (Lightricks) for Apple Silicon. Two-package monorepo mirroring the reference structure:
+
+- **ltx-core-mlx** (`ltx_core_mlx`) — model library: DiT, VAE, audio, text encoder, conditioning
+- **ltx-pipelines-mlx** (`ltx_pipelines_mlx`) — generation pipelines: T2V, I2V, retake, extend, keyframe, two-stage
 
 Loads pre-converted MLX weights from the [LTX-2.3 MLX collection on HuggingFace](https://huggingface.co/collections/dgrauet/ltx-23). Weight conversion is handled by [mlx-forge](https://github.com/dgrauet/mlx-forge).
 
@@ -10,7 +13,7 @@ Loads pre-converted MLX weights from the [LTX-2.3 MLX collection on HuggingFace]
 
 ## Tech Stack
 
-- Python 3.11+, `uv` package manager
+- Python 3.11+, `uv` workspace (monorepo with `packages/*`)
 - MLX (`mlx>=0.31.0`) — Apple Silicon ML framework (unified CPU/GPU memory)
 - `mlx-lm>=0.31.0` — for Gemma 3 text encoder loading
 - `safetensors`, `huggingface-hub`, `numpy`
@@ -21,50 +24,69 @@ Loads pre-converted MLX weights from the [LTX-2.3 MLX collection on HuggingFace]
 ## Architecture
 
 ```
-src/ltx_mlx/
-├── model/                    # Diffusion Transformer (DiT)
-│   ├── model.py              # LTXModel, X0Model, Modality dataclass
-│   ├── transformer.py        # BasicAVTransformerBlock (joint audio+video)
-│   ├── attention.py          # Multi-head attention + RoPE + per-head gating
-│   ├── feed_forward.py       # Gated MLP blocks
-│   ├── rope.py               # Rotary position embeddings (SPLIT type)
-│   └── timestep_embedding.py # AdaLayerNormSingle (6-param V1, 9-param V2)
+packages/
+├── ltx-core-mlx/                          # ltx_core_mlx
+│   └── src/ltx_core_mlx/
+│       ├── conditioning/                   # Latent conditioning system
+│       │   ├── mask_utils.py               # build/update/resolve attention masks
+│       │   └── types/
+│       │       ├── latent_cond.py          # LatentState, VideoConditionByLatentIndex
+│       │       ├── keyframe_cond.py        # VideoConditionByKeyframeIndex
+│       │       └── reference_video_cond.py # VideoConditionByReferenceLatent (IC-LoRA)
+│       │
+│       ├── model/
+│       │   ├── audio_vae/                  # Audio VAE + vocoder + BWE
+│       │   │   ├── audio_vae.py            # AudioVAEDecoder, AudioResBlock, AudioAttnBlock
+│       │   │   ├── encoder.py              # AudioVAEEncoder
+│       │   │   ├── vocoder.py              # BigVGANVocoder, SnakeBeta, Activation1d
+│       │   │   ├── bwe.py                  # VocoderWithBWE, HannSincResampler, MelSTFT
+│       │   │   └── processor.py            # AudioProcessor (STFT + mel filterbank)
+│       │   │
+│       │   ├── transformer/                # Diffusion Transformer (DiT)
+│       │   │   ├── model.py                # LTXModel, X0Model, LTXModelConfig
+│       │   │   ├── transformer.py          # BasicAVTransformerBlock (joint audio+video)
+│       │   │   ├── attention.py            # Multi-head attention + RoPE + per-head gating
+│       │   │   ├── feed_forward.py         # Gated MLP blocks
+│       │   │   ├── rope.py                 # Rotary position embeddings (SPLIT type)
+│       │   │   ├── adaln.py                # AdaLayerNormSingle (9-param)
+│       │   │   └── timestep_embedding.py   # Sinusoidal + MLP timestep encoding
+│       │   │
+│       │   ├── upsampler/                  # Neural latent upscaler
+│       │   │   └── model.py                # LatentUpsampler, SpatialRationalResampler
+│       │   │
+│       │   └── video_vae/                  # Video VAE
+│       │       ├── video_vae.py            # VideoDecoder (streaming), VideoEncoder
+│       │       ├── convolution.py          # Conv3dBlock (causal + reflect padding)
+│       │       ├── resnet.py               # ResBlock3d, ResBlockStage
+│       │       ├── sampling.py             # DepthToSpaceUpsample, pixel_shuffle_3d
+│       │       ├── patchifier.py           # VideoLatentPatchifier, AudioPatchifier
+│       │       ├── normalization.py        # pixel_norm (RMS)
+│       │       └── ops.py                  # PerChannelStatistics
+│       │
+│       ├── text_encoders/                  # Text encoding (Gemma 3)
+│       │   └── gemma/
+│       │       ├── language_model.py        # Gemma 3 12B wrapper via mlx-lm
+│       │       ├── embeddings_connector.py  # Embeddings1DConnector (RoPE + registers)
+│       │       └── feature_extractor.py     # GemmaFeaturesExtractorV2 (video/audio projections)
+│       │
+│       └── utils/
+│           ├── positions.py    # compute_video_positions, compute_audio_positions
+│           ├── weights.py      # load_split_safetensors, apply_quantization
+│           ├── memory.py       # aggressive_cleanup, get_memory_stats
+│           ├── image.py        # prepare_image_for_encoding
+│           └── ffmpeg.py       # find_ffmpeg, probe_video_info
 │
-├── vae/                      # Video VAE
-│   ├── decoder.py            # VideoDecoder — streaming frame-by-frame to ffmpeg
-│   ├── encoder.py            # VideoEncoder — image/video → latent
-│   └── patchifier.py         # VideoLatentPatchifier, AudioPatchifier, shape utils
-│
-├── audio/                    # Audio pipeline
-│   ├── decoder.py            # Audio VAE decoder: latent (B,8,T,16) → mel (B,2,T',64)
-│   ├── encoder.py            # Audio VAE encoder: mel → latent
-│   ├── processor.py          # AudioProcessor: STFT + mel filterbank
-│   ├── vocoder.py            # BigVGAN v2: mel → waveform 16kHz
-│   └── bwe.py                # Bandwidth Extension: 16kHz → 48kHz (VocoderWithBWE)
-│
-├── text_encoder/             # Text encoding (Gemma 3)
-│   ├── language_model.py     # Gemma 3 12B wrapper via mlx-lm
-│   ├── connector.py          # Embeddings1DConnector — RoPE refinement, learnable registers
-│   └── feature_extractor.py  # GemmaFeaturesExtractorV2 — separate video/audio projections
-│
-├── conditioning/             # Latent conditioning system
-│   ├── latent.py             # LatentState, VideoConditionByLatentIndex, core functions
-│   ├── keyframe.py           # VideoConditionByKeyframeIndex (appended tokens + attn mask)
-│   └── reference.py          # VideoConditionByReferenceLatent (IC-LoRA)
-│
-├── pipeline/                 # Generation pipelines
-│   ├── denoise.py            # Euler denoising loop (joint audio+video)
-│   ├── generate.py           # High-level generate() API
-│   └── scheduler.py          # Sigma schedules (DISTILLED_SIGMAS, STAGE_2_SIGMAS)
-│
-├── upsampler/                # Neural latent upscaler
-│   └── upsampler.py          # LatentUpsampler (Conv3d ResBlocks + 2× spatial)
-│
-└── utils/                    # Shared utilities
-    ├── ffmpeg.py             # find_ffmpeg, find_ffprobe, probe_video_info, has_audio_stream
-    ├── image.py              # prepare_image_for_encoding (PIL → tensor)
-    ├── weights.py            # load_split_safetensors, apply_quantization
-    └── memory.py             # aggressive_cleanup, get_memory_stats
+└── ltx-pipelines-mlx/                     # ltx_pipelines_mlx
+    └── src/ltx_pipelines_mlx/
+        ├── text_to_video.py    # T2V: prompt → video+audio
+        ├── image_to_video.py   # I2V: image + prompt → video+audio
+        ├── retake.py           # Retake: regenerate a time segment
+        ├── extend.py           # Extend: add frames before/after
+        ├── keyframe_interp.py  # Keyframe interpolation
+        ├── two_stage.py        # Two-stage: half res → upscale → refine
+        ├── denoise.py          # Euler denoising loop (joint audio+video)
+        ├── scheduler.py        # DISTILLED_SIGMAS, STAGE_2_SIGMAS
+        └── cli.py              # CLI entry point
 ```
 
 ---
@@ -75,8 +97,8 @@ src/ltx_mlx/
 - **Transformer**: 48 layers × 32 heads × 128-dim = 4096-dim (video), 32 heads × 64-dim = 2048-dim (audio)
 - **VAE**: Temporal 8×, Spatial 32× compression → 128-channel latent
 - **Text encoder**: Gemma 3 12B → dual projections (video 4096-dim, audio 2048-dim) via Embeddings1DConnector
-- **Vocoder**: BigVGAN v2 with SnakeBeta activation + anti-aliased resampling
-- **BWE**: Residual bandwidth extension (base 16kHz → upsample 3× → mel → BWE generator → 48kHz)
+- **Vocoder**: BigVGAN v2 with SnakeBeta activation (log-scale alpha/beta) + anti-aliased resampling
+- **BWE**: Residual bandwidth extension (base 16kHz → Hann-sinc 3× resample → causal MelSTFT → BWE generator → 48kHz)
 - **Distilled**: 8 steps (predefined sigma schedule), no classifier-free guidance
 
 ### Key Shapes
@@ -91,6 +113,10 @@ src/ltx_mlx/
 | Vocoder | mel (B, 2, T', 64) | waveform (B, 2, T_audio) @ 16kHz |
 | BWE | waveform 16kHz | waveform 48kHz |
 | Upsampler | latent (B, 128, F, H, W) | latent (B, 128, F, 2H, 2W) |
+
+### Audio Token Count
+
+Audio tokens per video: `round(num_pixel_frames / fps * 25)` where 25 = sample_rate(16000) / hop_length(160) / downsample_factor(4).
 
 ---
 
@@ -143,12 +169,8 @@ Weights are pre-converted by [mlx-forge](https://github.com/dgrauet/mlx-forge) a
 ### 1. Metal Memory Management (NON-NEGOTIABLE)
 
 ```python
-import gc
-import mlx.core as mx
-
-def aggressive_cleanup():
-    gc.collect()
-    mx.clear_cache()
+from ltx_core_mlx.utils.memory import aggressive_cleanup
+aggressive_cleanup()  # gc.collect() + mx.clear_cache()
 ```
 
 Call between **every pipeline stage**. MLX Metal cache grows unbounded without explicit cleanup.
@@ -171,16 +193,61 @@ for i in range(num_frames):
 **ALWAYS** port from [ltx-core](https://github.com/Lightricks/LTX-2/tree/main/packages/ltx-core) (Lightricks official), NOT from mlx-video.
 
 Key reference paths:
-- `ltx-core/src/ltx_core/model/transformer/` — DiT architecture
-- `ltx-core/src/ltx_core/model/audio_vae/` — Audio VAE + vocoder + BWE
-- `ltx-core/src/ltx_core/model/video_vae/` — Video VAE
-- `ltx-core/src/ltx_core/conditioning/` — Conditioning system
-- `ltx-core/src/ltx_core/components/` — Schedulers, patchifiers, guiders
-- `ltx-pipelines/src/ltx_pipelines/` — Pipeline implementations
+- `packages/ltx-core/src/ltx_core/model/transformer/` — DiT architecture
+- `packages/ltx-core/src/ltx_core/model/audio_vae/` — Audio VAE + vocoder + BWE
+- `packages/ltx-core/src/ltx_core/model/video_vae/` — Video VAE
+- `packages/ltx-core/src/ltx_core/conditioning/` — Conditioning system
+- `packages/ltx-core/src/ltx_core/components/` — Schedulers, patchifiers, guiders
+- `packages/ltx-pipelines/src/ltx_pipelines/` — Pipeline implementations
 
 ### 4. No Weight Conversion in This Package
 
 Weight conversion is handled by [mlx-forge](https://github.com/dgrauet/mlx-forge). This package loads pre-converted weights only.
+
+### 5. Positions Must Be in Pixel-Space
+
+Video positions use pixel-space coordinates with causal fix, divided by fps:
+- Temporal: `midpoint(max(0, i*8 - 7), i*8 + 1) / fps`
+- Spatial: `h * 32 + 16`, `w * 32 + 16`
+
+Audio positions use real-time seconds: `midpoint(max(0, (i-3)*4) * 0.01, max(0, (i-2)*4) * 0.01)`
+
+Never use raw latent indices as positions.
+
+### 6. Per-Token Timesteps for Conditioning
+
+When conditioning (I2V, retake, extend), use per-token timesteps `sigma * denoise_mask`:
+- X0Model denoising: `x0 = x_t - per_token_sigma * v` (preserved tokens get sigma=0 → x0=x_t)
+- AdaLN: reshape per-token params as `(B, N, P, dim)` not `(B*N, P, dim)`
+
+---
+
+## Conditioning System
+
+### Core Types
+- `LatentState(latent, clean_latent, denoise_mask, positions?, attention_mask?)` — generation state
+- `denoise_mask`: `1.0` = denoise (generate), `0.0` = preserve (keep clean)
+- `positions`: (B, N, num_axes) pixel-space positions for RoPE
+- `attention_mask`: (B, N, N) optional self-attention mask [0,1]
+
+### Conditioning Items
+- `VideoConditionByLatentIndex(frame_indices, clean_latent, strength)` — replace tokens at frame index (I2V)
+- `VideoConditionByKeyframeIndex(indices, latents, positions, strength)` — append tokens (interpolation)
+- `VideoConditionByReferenceLatent(latent, positions, downscale_factor, strength)` — append reference (IC-LoRA)
+- `TemporalRegionMask(start_frame, end_frame)` — time-range masking (retake)
+
+### Attention Mask System
+- `mask_utils.build_attention_mask()` — block-structured (B, N+M, N+M) mask
+- `mask_utils.update_attention_mask()` — incremental mask building for conditioning items
+- Conditioning items call `update_attention_mask` when appending tokens
+
+### Diffusion Loop
+```python
+# denoise_loop resolves positions/attention_mask from LatentState automatically
+# Per-step: video_timesteps = sigma * denoise_mask (preserved regions get sigma=0)
+# Per-step: x0 = apply_denoise_mask(x0, clean_latent, mask) → blend before Euler step
+# Noising: noise_latent_state() blends clean*(1-mask) + noisy*mask
+```
 
 ---
 
@@ -189,42 +256,18 @@ Weight conversion is handled by [mlx-forge](https://github.com/dgrauet/mlx-forge
 ### Full Chain
 ```
 Audio latent (B, 8, T, 16)
-    → Audio VAE decoder → mel (B, 2, T', 64)
-    → BigVGAN v2 vocoder → waveform @ 16kHz
-    → BWE → waveform @ 48kHz
+    → Audio VAE decoder (causal Conv2d + PixelNorm + AttnBlock) → mel (B, 2, T', 64)
+    → BigVGAN v2 vocoder (SnakeBeta log-scale + anti-aliased) → waveform @ 16kHz
+    → BWE (Hann-sinc 3× resample + causal MelSTFT + BigVGAN residual) → waveform @ 48kHz
 ```
 
-### Vocoder (Base, 16kHz)
-- Upsample ratios: `[5, 2, 2, 2, 2, 2]` → 160× (hop_length=160 at 16kHz)
-- Kernel sizes: `[11, 4, 4, 4, 4, 4]`
-- Activation: SnakeBeta + anti-aliased resampling (Activation1d)
-- 3 × AMPBlock1 per upsample stage
-
-### BWE (16kHz → 48kHz)
-- Resampler: 3× upsample (kaiser-sinc)
-- BWE generator: separate BigVGAN with ratios `[6, 5, 2, 2, 2]` (240×)
-- MelSTFT: `mel_basis (64, 257)`, STFT basis `(514, 1, 512)`
-- Output: `clamp(resampled_base + bwe_residual, -1, 1)`
-
----
-
-## Conditioning System
-
-### Core Types
-- `LatentState(latent, clean_latent, denoise_mask)` — generation state
-- `denoise_mask`: `1.0` = denoise (generate), `0.0` = preserve (keep clean)
-
-### Conditioning Items
-- `VideoConditionByLatentIndex` — replace tokens at frame index (I2V)
-- `VideoConditionByKeyframeIndex` — append tokens with attention mask (interpolation)
-- `VideoConditionByReferenceLatent` — append reference with scaled positions (IC-LoRA)
-- `TemporalRegionMask` — time-range masking (retake)
-
-### Diffusion Loop
-```python
-# Per-step: timesteps = sigma × denoise_mask (preserved regions get sigma=0)
-# Per-step: x0 = apply_denoise_mask(x0, clean_latent, mask) → blend before Euler step
-```
+### Key Implementation Details
+- **SnakeBeta**: weights stored in log-scale, forward applies `exp(alpha)` and `exp(beta)`
+- **Audio VAE Conv2d**: causal padding on height axis (time), reflect padding NOT used (zeros)
+- **Audio VAE upsample**: drop first row after causal conv for temporal alignment
+- **BWE resampler**: Hann-windowed sinc, 43 taps, rolloff=0.99 (NOT Kaiser)
+- **BWE MelSTFT**: causal left-only padding (352, 0), NOT symmetric
+- **BWE generator**: `apply_final_activation=False` (no tanh on residual)
 
 ---
 
@@ -236,6 +279,7 @@ Audio latent (B, 8, T, 16)
 - ruff for formatting/linting
 - Tests in `tests/` using pytest
 - Conventional commits (feat:, fix:, docs:, refactor:)
+- Package imports: `ltx_core_mlx.*` for core, `ltx_pipelines_mlx.*` for pipelines
 
 ---
 
