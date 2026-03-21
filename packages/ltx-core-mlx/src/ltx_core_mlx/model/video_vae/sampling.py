@@ -19,20 +19,11 @@ def pixel_shuffle_3d(
     x: mx.array,
     spatial_factor: int,
     temporal_factor: int,
-    *,
-    swap_hw: bool = False,
 ) -> mx.array:
     """Rearrange channels into spatial/temporal dimensions (depth-to-space).
 
-    Two einops patterns exist in the reference, differing in H/W mapping:
-
-    Intermediate DepthToSpaceUpsample (swap_hw=False, default):
-        ``"b (c p1 p2 p3) d h w -> b c (d p1) (h p2) (w p3)"``
-        p2 (slower, stride sf) → H, p3 (faster, stride 1) → W.
-
-    Final unpatchify / conv_out (swap_hw=True):
-        ``"b (c p r q) f h w -> b c (f p) (h q) (w r)"``
-        r (slower, stride sf) → W, q (faster, stride 1) → H.
+    Matches: ``"b (c p1 p2 p3) d h w -> b c (d p1) (h p2) (w p3)"``
+    In BDHWC layout: C_total = C * tf * sf * sf where C varies slowest.
 
     Input:  (B, D, H, W, C * sf^2 * tf)
     Output: (B, D*tf, H*sf, W*sf, C)
@@ -40,12 +31,7 @@ def pixel_shuffle_3d(
     B, D, H, W, C_total = x.shape
     C = C_total // (spatial_factor * spatial_factor * temporal_factor)
     x = x.reshape(B, D, H, W, C, temporal_factor, spatial_factor, spatial_factor)
-    if swap_hw:
-        # Final unpatchify: dim6 (stride sf) → W, dim7 (stride 1) → H
-        x = x.transpose(0, 1, 5, 2, 7, 3, 6, 4)
-    else:
-        # Intermediate DepthToSpace: dim6 (stride sf) → H, dim7 (stride 1) → W
-        x = x.transpose(0, 1, 5, 2, 6, 3, 7, 4)
+    x = x.transpose(0, 1, 5, 2, 6, 3, 7, 4)
     x = x.reshape(B, D * temporal_factor, H * spatial_factor, W * spatial_factor, C)
     return x
 

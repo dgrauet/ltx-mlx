@@ -167,9 +167,7 @@ class VideoDecoder(nn.Module):
         x = self.conv_out(nn.silu(pixel_norm(x)))
 
         # Final spatial pixel shuffle: 48 -> 3 channels, 4x spatial expansion
-        # Uses swap_hw=True because the reference unpatchify has r→W (slower), q→H (faster),
-        # which is the opposite of the intermediate DepthToSpaceUpsample pattern.
-        x = pixel_shuffle_3d(x, spatial_factor=4, temporal_factor=1, swap_hw=True)
+        x = pixel_shuffle_3d(x, spatial_factor=4, temporal_factor=1)
 
         # BFHWC -> BCFHW
         return x.transpose(0, 4, 1, 2, 3)
