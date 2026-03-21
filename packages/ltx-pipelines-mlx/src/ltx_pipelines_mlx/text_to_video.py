@@ -96,7 +96,7 @@ class TextToVideoPipeline:
 
         # Load audio decoder + vocoder
         self.audio_decoder = AudioVAEDecoder()
-        audio_weights = load_split_safetensors(model_dir / "audio_vae.safetensors", prefix="audio_vae.")
+        audio_weights = load_split_safetensors(model_dir / "audio_vae.safetensors", prefix="audio_vae.decoder.")
         audio_weights = remap_audio_vae_keys(audio_weights)
         self.audio_decoder.load_weights(list(audio_weights.items()))
         aggressive_cleanup()
