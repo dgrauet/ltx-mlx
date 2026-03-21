@@ -11,10 +11,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v4
-      - run: uv venv && uv pip install ruff>=0.7.0
-      - run: .venv/bin/ruff check src/
-      - run: .venv/bin/ruff format --check src/
+      - uses: astral-sh/ruff-action@v3
+        with:
+          args: check packages/ tests/
+      - uses: astral-sh/ruff-action@v3
+        with:
+          args: format --check packages/ tests/
 
   test:
     runs-on: macos-latest
@@ -24,5 +26,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v4
-      - run: uv venv --python ${{ matrix.python-version }} && uv pip install -e ".[dev]"
-      - run: .venv/bin/pytest tests/ -v -m "not slow" --tb=short
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: uv sync --all-extras
+      - run: uv run pytest tests/ -v -m "not slow" --tb=short
