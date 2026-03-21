@@ -196,12 +196,15 @@ def noise_latent_state(
 ) -> LatentState:
     """Add noise to a latent state respecting the denoise mask.
 
-    Preserved regions (mask=0) keep clean_latent unchanged.
-    Generated regions (mask=1) become clean_latent + sigma * noise.
+    Matches reference GaussianNoiser: interpolates between noise and clean
+    based on denoise_mask * noise_scale (sigma).
+
+    Preserved regions (mask=0): keep clean_latent.
+    Generated regions (mask=1): latent = noise * sigma + clean * (1 - sigma).
 
     Args:
         state: Current latent state (with clean_latent and denoise_mask set).
-        sigma: Initial noise level (typically 1.0 for full schedule).
+        sigma: Noise scale (typically 1.0 for full noise, or start_sigma for stage 2).
         seed: Random seed for reproducible noise.
 
     Returns:
@@ -209,8 +212,8 @@ def noise_latent_state(
     """
     mx.random.seed(seed)
     noise = mx.random.normal(state.clean_latent.shape).astype(state.clean_latent.dtype)
-    noisy = state.clean_latent + sigma * noise
-    latent = state.clean_latent * (1.0 - state.denoise_mask) + noisy * state.denoise_mask
+    scaled_mask = state.denoise_mask * sigma
+    latent = noise * scaled_mask + state.clean_latent * (1.0 - scaled_mask)
     return LatentState(
         latent=latent,
         clean_latent=state.clean_latent,

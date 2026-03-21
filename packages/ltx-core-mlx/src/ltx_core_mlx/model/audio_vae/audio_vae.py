@@ -310,7 +310,7 @@ class AudioVAEDecoder(nn.Module):
 
         # Reshape back to 2D spatial: (B, T, 16, 8) — NHWC for Conv2d
         # T = height, 16 = width (frequency), 8 = channels
-        x = x_flat.reshape(B, T, C2, C1)  # (B, T, 16, 8)
+        x = x_flat.reshape(B, T, C1, C2).transpose(0, 1, 3, 2)  # (B, T, 8, 16) → (B, T, 16, 8) NHWC
 
         # Encoder/Decoder
         x = self.conv_in(x)  # (B, T, 16, 512)
