@@ -86,6 +86,7 @@ class LtxvTrainer:
         self._collect_trainable_params()
         self._load_checkpoint()
 
+        self._init_timestep_sampler()
         self._global_step = -1
         self._checkpoint_paths: list[Path] = []
         self._init_wandb()
@@ -146,7 +147,10 @@ class LtxvTrainer:
                 if sampled_videos_paths and self._config.wandb.log_validation_videos:
                     self._log_validation_samples(sampled_videos_paths, cfg.validation.prompts)
 
-            for step in range(cfg.optimization.steps * cfg.optimization.gradient_accumulation_steps):
+            accum_steps = cfg.optimization.gradient_accumulation_steps
+            accumulated_grads: Any = None
+
+            for step in range(cfg.optimization.steps * accum_steps):
                 # Get next batch
                 try:
                     batch = next(data_iter)
@@ -156,7 +160,7 @@ class LtxvTrainer:
 
                 step_start_time = time.time()
 
-                is_optimization_step = (step + 1) % cfg.optimization.gradient_accumulation_steps == 0
+                is_optimization_step = (step + 1) % accum_steps == 0
                 if is_optimization_step:
                     self._global_step += 1
 
@@ -164,14 +168,27 @@ class LtxvTrainer:
                 loss, grads = loss_and_grad_fn(batch)
                 _materialize(loss)
 
-                # Gradient clipping
-                if cfg.optimization.max_grad_norm > 0:
-                    grads, grad_norm = optim.clip_grad_norm(grads, max_norm=cfg.optimization.max_grad_norm)
-                    _materialize(grad_norm)
+                # Accumulate gradients
+                if accum_steps > 1:
+                    if accumulated_grads is None:
+                        accumulated_grads = grads
+                    else:
+                        accumulated_grads = nn.utils.tree_map(lambda a, b: a + b, accumulated_grads, grads)
 
-                # Optimizer step
-                self._optimizer.update(self._transformer, grads)
-                _materialize(self._transformer.parameters())
+                if is_optimization_step:
+                    # Average accumulated gradients
+                    if accum_steps > 1 and accumulated_grads is not None:
+                        grads = nn.utils.tree_map(lambda g: g / accum_steps, accumulated_grads)
+                        accumulated_grads = None
+
+                    # Gradient clipping
+                    if cfg.optimization.max_grad_norm > 0:
+                        grads, grad_norm = optim.clip_grad_norm(grads, max_norm=cfg.optimization.max_grad_norm)
+                        _materialize(grad_norm)
+
+                    # Optimizer step
+                    self._optimizer.update(self._transformer, grads)
+                    _materialize((self._optimizer.state, self._transformer.parameters()))
 
                 # Learning rate scheduling
                 if self._lr_schedule is not None and is_optimization_step:
@@ -325,12 +342,32 @@ class LtxvTrainer:
             # Use strategy to prepare inputs
             model_inputs = strategy.prepare_training_inputs(batch, self._timestep_sampler)
 
-            # Forward pass
-            video_pred, audio_pred = self._transformer(
-                video=model_inputs.video,
-                audio=model_inputs.audio,
-                perturbations=None,
+            # Forward pass — call the inner LTXModel (returns velocity,
+            # not x0) since training targets are velocity (noise - clean).
+            video_inputs = model_inputs.video
+            audio_inputs = model_inputs.audio
+
+            call_kwargs: dict = dict(
+                video_latent=video_inputs.latent,
+                video_text_embeds=video_inputs.context,
+                video_positions=video_inputs.positions,
+                sigma=video_inputs.sigma,
+                video_timesteps=video_inputs.timesteps,
             )
+
+            if audio_inputs is not None:
+                call_kwargs["audio_latent"] = audio_inputs.latent
+                call_kwargs["audio_text_embeds"] = audio_inputs.context
+                call_kwargs["audio_positions"] = audio_inputs.positions
+                call_kwargs["audio_timesteps"] = audio_inputs.timesteps
+            else:
+                # Dummy audio for the joint model
+                call_kwargs["audio_latent"] = mx.zeros((video_inputs.latent.shape[0], 1, 128), dtype=mx.bfloat16)
+                call_kwargs["audio_text_embeds"] = mx.zeros_like(video_inputs.context)
+
+            # Use inner model (LTXModel) which returns velocity directly,
+            # NOT X0Model which converts to x0 predictions
+            video_pred, audio_pred = self._transformer.model(**call_kwargs)
 
             # Compute loss
             return strategy.compute_loss(video_pred, audio_pred, model_inputs)
@@ -443,20 +480,13 @@ class LtxvTrainer:
         lora_layers = _find_lora_targets(self._transformer, lora_cfg.target_modules)
 
         for layer_path, module in lora_layers:
-            # Create LoRA linear replacement
-            in_features = module.weight.shape[1]
-            out_features = module.weight.shape[0]
-            lora_linear = nn.LoRALinear(
-                input_dims=in_features,
-                output_dims=out_features,
-                rank=lora_cfg.rank,
+            # Create LoRA linear replacement using nn.LoRALinear
+            # MLX's nn.LoRALinear.from_linear() copies weights automatically
+            lora_linear = nn.LoRALinear.from_linear(
+                module,
+                r=lora_cfg.rank,
                 scale=lora_cfg.alpha / lora_cfg.rank,
-                dropout=lora_cfg.dropout,
             )
-            # Copy base weights
-            lora_linear.linear.weight = module.weight
-            if hasattr(module, "bias") and module.bias is not None:
-                lora_linear.linear.bias = module.bias
 
             # Set the LoRA linear in place
             _set_module_by_path(self._transformer, layer_path, lora_linear)

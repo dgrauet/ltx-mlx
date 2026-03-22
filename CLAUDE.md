@@ -2,10 +2,11 @@
 
 ## Project Overview
 
-Pure MLX port of [ltx-core](https://github.com/Lightricks/LTX-2/tree/main/packages/ltx-core) and [ltx-pipelines](https://github.com/Lightricks/LTX-2/tree/main/packages/ltx-pipelines) (Lightricks) for Apple Silicon. Two-package monorepo mirroring the reference structure:
+Pure MLX port of [LTX-2](https://github.com/Lightricks/LTX-2/) (Lightricks) for Apple Silicon. Three-package monorepo mirroring the reference structure:
 
 - **ltx-core-mlx** (`ltx_core_mlx`) — model library: DiT, VAE, audio, text encoder, conditioning
 - **ltx-pipelines-mlx** (`ltx_pipelines_mlx`) — generation pipelines: T2V, I2V, retake, extend, keyframe, two-stage
+- **ltx-trainer** (`ltx_trainer_mlx`) - ltx-2 training, democratized.
 
 Loads pre-converted MLX weights from the [LTX-2.3 MLX collection on HuggingFace](https://huggingface.co/collections/dgrauet/ltx-23). Weight conversion is handled by [mlx-forge](https://github.com/dgrauet/mlx-forge).
 
