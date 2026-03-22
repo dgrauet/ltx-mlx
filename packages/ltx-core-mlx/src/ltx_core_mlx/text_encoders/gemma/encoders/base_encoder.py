@@ -259,6 +259,7 @@ class GemmaLanguageModel(nn.Module):
             raise RuntimeError("Model not loaded. Call load() first.")
 
         from mlx_lm import generate as mlx_generate
+        from mlx_lm.sample_utils import make_sampler
 
         # Format as chat template
         chat_text = self._tokenizer.apply_chat_template(
@@ -268,12 +269,13 @@ class GemmaLanguageModel(nn.Module):
         )
 
         mx.random.seed(seed)
+        sampler = make_sampler(temp=0.7)
         result = mlx_generate(
             model=self._model,
             tokenizer=self._tokenizer,
             prompt=chat_text,
             max_tokens=max_new_tokens,
-            temp=0.7,
+            sampler=sampler,
             verbose=False,
         )
         return result.strip()

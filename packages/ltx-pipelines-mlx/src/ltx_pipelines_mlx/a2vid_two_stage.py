@@ -57,10 +57,18 @@ class AudioToVideoPipeline(TextToVideoPipeline):
             self.audio_processor = AudioProcessor()
 
         if self.upsampler is None:
-            self.upsampler = LatentUpsampler()
-            upsampler_path = self.model_dir / "upsampler.safetensors"
-            if upsampler_path.exists():
-                weights = load_split_safetensors(upsampler_path)
+            import json
+
+            name = "spatial_upscaler_x2_v1_1"
+            config_path = self.model_dir / f"{name}_config.json"
+            weights_path = self.model_dir / f"{name}.safetensors"
+            if config_path.exists():
+                config = json.loads(config_path.read_text()).get("config", {})
+                self.upsampler = LatentUpsampler.from_config(config)
+            else:
+                self.upsampler = LatentUpsampler()
+            if weights_path.exists():
+                weights = load_split_safetensors(weights_path, prefix=f"{name}.")
                 self.upsampler.load_weights(list(weights.items()))
             aggressive_cleanup()
 

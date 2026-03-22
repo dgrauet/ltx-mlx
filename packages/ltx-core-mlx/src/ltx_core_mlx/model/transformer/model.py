@@ -233,30 +233,33 @@ class LTXModel(nn.Module):
         )
 
         # Video AdaLN: per-token or scalar
+        # Note: prompt AdaLN always uses scalar timestep — text embeddings
+        # don't correspond to individual latent tokens, so per-token
+        # modulation would cause a shape mismatch in cross-attention.
         if video_timesteps is not None:
             vt_emb = self._embed_timestep_per_token(video_timesteps)
             video_adaln_emb, video_embedded_ts = self._adaln_per_token(self.adaln_single, vt_emb)
-            video_prompt_emb, _ = self._adaln_per_token(self.prompt_adaln_single, vt_emb)
             av_ca_video_emb, _ = self._adaln_per_token(self.av_ca_video_scale_shift_adaln_single, vt_emb)
             av_ca_a2v_gate_emb, _ = self._adaln_per_token(self.av_ca_a2v_gate_adaln_single, vt_emb)
         else:
             video_adaln_emb, video_embedded_ts = self.adaln_single(t_emb)
-            video_prompt_emb, _ = self.prompt_adaln_single(t_emb)
             av_ca_video_emb, _ = self.av_ca_video_scale_shift_adaln_single(t_emb)
             av_ca_a2v_gate_emb, _ = self.av_ca_a2v_gate_adaln_single(t_emb_av_gate)
+        # Prompt AdaLN: always scalar (from global timestep)
+        video_prompt_emb, _ = self.prompt_adaln_single(t_emb)
 
         # Audio AdaLN: per-token or scalar
         if audio_timesteps is not None:
             at_emb = self._embed_timestep_per_token(audio_timesteps)
             audio_adaln_emb, audio_embedded_ts = self._adaln_per_token(self.audio_adaln_single, at_emb)
-            audio_prompt_emb, _ = self._adaln_per_token(self.audio_prompt_adaln_single, at_emb)
             av_ca_audio_emb, _ = self._adaln_per_token(self.av_ca_audio_scale_shift_adaln_single, at_emb)
             av_ca_v2a_gate_emb, _ = self._adaln_per_token(self.av_ca_v2a_gate_adaln_single, at_emb)
         else:
             audio_adaln_emb, audio_embedded_ts = self.audio_adaln_single(t_emb)
-            audio_prompt_emb, _ = self.audio_prompt_adaln_single(t_emb)
             av_ca_audio_emb, _ = self.av_ca_audio_scale_shift_adaln_single(t_emb)
             av_ca_v2a_gate_emb, _ = self.av_ca_v2a_gate_adaln_single(t_emb_av_gate)
+        # Audio prompt AdaLN: always scalar (from global timestep)
+        audio_prompt_emb, _ = self.audio_prompt_adaln_single(t_emb)
 
         # RoPE frequencies (per-head, using reference log-spaced grid)
         video_rope_freqs = None

@@ -314,8 +314,13 @@ class ImageToVideoPipeline(TextToVideoPipeline):
         low_memory: If True, aggressively free memory between stages.
     """
 
-    def __init__(self, model_dir: str, low_memory: bool = True):
-        super().__init__(model_dir, low_memory)
+    def __init__(
+        self,
+        model_dir: str,
+        gemma_model_id: str = "mlx-community/gemma-3-12b-it-4bit",
+        low_memory: bool = True,
+    ):
+        super().__init__(model_dir, gemma_model_id=gemma_model_id, low_memory=low_memory)
         self.vae_encoder: VideoEncoder | None = None
 
     def load(self) -> None:
@@ -327,6 +332,11 @@ class ImageToVideoPipeline(TextToVideoPipeline):
 
             self.vae_encoder = VideoEncoder()
             enc_weights = load_split_safetensors(self.model_dir / "vae_encoder.safetensors", prefix="vae_encoder.")
+            # Remap underscore-prefixed per-channel stats keys
+            enc_weights = {
+                k.replace("._mean_of_means", ".mean_of_means").replace("._std_of_means", ".std_of_means"): v
+                for k, v in enc_weights.items()
+            }
             self.vae_encoder.load_weights(list(enc_weights.items()))
             aggressive_cleanup()
 

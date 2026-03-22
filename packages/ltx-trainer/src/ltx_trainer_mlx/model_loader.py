@@ -85,6 +85,11 @@ def load_video_vae_encoder(
 
     model = VideoEncoder()
     weights = load_split_safetensors(model_dir / "vae_encoder.safetensors", prefix="vae_encoder.")
+    # Remap underscore-prefixed per-channel stats keys
+    weights = {
+        k.replace("._mean_of_means", ".mean_of_means").replace("._std_of_means", ".std_of_means"): v
+        for k, v in weights.items()
+    }
     model.load_weights(list(weights.items()))
     aggressive_cleanup()
 

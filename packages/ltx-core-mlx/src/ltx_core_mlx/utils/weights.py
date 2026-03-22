@@ -38,22 +38,52 @@ def load_split_safetensors(
     return weights
 
 
+def _detect_quantization_bits(
+    weights: dict[str, mx.array],
+    group_size: int = 64,
+) -> int:
+    """Auto-detect quantization bit width from weight shapes.
+
+    For a quantized Linear(I, O):
+      - scales shape: (O, I / group_size)
+      - weight shape: (O, I * bits / 32)
+    So bits = weight_cols * 32 / (scales_cols * group_size).
+
+    Args:
+        weights: Weight dict containing .weight and .scales keys.
+        group_size: Quantization group size.
+
+    Returns:
+        Detected bit width (typically 4 or 8).
+    """
+    for key in weights:
+        if key.endswith(".scales"):
+            weight_key = key.rsplit(".scales", 1)[0] + ".weight"
+            if weight_key in weights:
+                weight_cols = weights[weight_key].shape[-1]
+                scales_cols = weights[key].shape[-1]
+                bits = round(weight_cols * 32 / (scales_cols * group_size))
+                return bits
+    return 8  # default fallback
+
+
 def apply_quantization(
     model: nn.Module,
     weights: dict[str, mx.array],
     group_size: int = 64,
-    bits: int = 8,
+    bits: int | None = None,
 ) -> None:
     """Apply quantization to Linear layers that have quantized weights.
 
     Detects quantized layers by checking for 'scales' and 'biases' keys
     in the weight dict and calls nn.quantize on matching layers.
+    Bit width is auto-detected from weight shapes if not specified.
 
     Args:
         model: The nn.Module to quantize.
         weights: Weight dict (may contain scales/biases for quantized layers).
         group_size: Quantization group size.
-        bits: Quantization bit width.
+        bits: Quantization bit width. Auto-detected if None.
     """
     quantized_layers: set[str] = set()
 
@@ -64,6 +94,9 @@ def apply_quantization(
 
     if not quantized_layers:
         return
+
+    if bits is None:
+        bits = _detect_quantization_bits(weights, group_size)
 
     # Build class predicate: only quantize layers that have scales in the weights
     def _should_quantize(path: str, _module: nn.Module) -> bool:

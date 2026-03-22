@@ -46,8 +46,13 @@ class TwoStageHQPipeline(TextToVideoPipeline):
         low_memory: Aggressive memory management.
     """
 
-    def __init__(self, model_dir: str, low_memory: bool = True):
-        super().__init__(model_dir, low_memory)
+    def __init__(
+        self,
+        model_dir: str,
+        gemma_model_id: str = "mlx-community/gemma-3-12b-it-4bit",
+        low_memory: bool = True,
+    ):
+        super().__init__(model_dir, gemma_model_id=gemma_model_id, low_memory=low_memory)
         self.vae_encoder: VideoEncoder | None = None
         self.upsampler: LatentUpsampler | None = None
 
@@ -58,14 +63,27 @@ class TwoStageHQPipeline(TextToVideoPipeline):
         if self.vae_encoder is None:
             self.vae_encoder = VideoEncoder()
             enc_weights = load_split_safetensors(self.model_dir / "vae_encoder.safetensors", prefix="vae_encoder.")
+            # Remap underscore-prefixed per-channel stats keys
+            enc_weights = {
+                k.replace("._mean_of_means", ".mean_of_means").replace("._std_of_means", ".std_of_means"): v
+                for k, v in enc_weights.items()
+            }
             self.vae_encoder.load_weights(list(enc_weights.items()))
             aggressive_cleanup()
 
         if self.upsampler is None:
-            self.upsampler = LatentUpsampler()
-            upsampler_path = self.model_dir / "upsampler.safetensors"
-            if upsampler_path.exists():
-                weights = load_split_safetensors(upsampler_path)
+            import json
+
+            name = "spatial_upscaler_x2_v1_1"
+            config_path = self.model_dir / f"{name}_config.json"
+            weights_path = self.model_dir / f"{name}.safetensors"
+            if config_path.exists():
+                config = json.loads(config_path.read_text()).get("config", {})
+                self.upsampler = LatentUpsampler.from_config(config)
+            else:
+                self.upsampler = LatentUpsampler()
+            if weights_path.exists():
+                weights = load_split_safetensors(weights_path, prefix=f"{name}.")
                 self.upsampler.load_weights(list(weights.items()))
             aggressive_cleanup()
 

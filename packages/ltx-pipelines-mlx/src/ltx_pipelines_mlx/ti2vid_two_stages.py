@@ -32,22 +32,43 @@ class TwoStagePipeline(TextToVideoPipeline):
         low_memory: Aggressive memory management.
     """
 
-    def __init__(self, model_dir: str, low_memory: bool = True):
-        super().__init__(model_dir, low_memory)
+    def __init__(
+        self,
+        model_dir: str,
+        gemma_model_id: str = "mlx-community/gemma-3-12b-it-4bit",
+        low_memory: bool = True,
+    ):
+        super().__init__(model_dir, gemma_model_id=gemma_model_id, low_memory=low_memory)
         self.upsampler: LatentUpsampler | None = None
+
+    def _load_upsampler(self, name: str = "spatial_upscaler_x2_v1_1") -> None:
+        """Load upsampler from config and weights.
+
+        Args:
+            name: Base name of the upsampler files (without extension).
+        """
+        import json
+
+        config_path = self.model_dir / f"{name}_config.json"
+        weights_path = self.model_dir / f"{name}.safetensors"
+
+        if config_path.exists():
+            config = json.loads(config_path.read_text()).get("config", {})
+            self.upsampler = LatentUpsampler.from_config(config)
+        else:
+            self.upsampler = LatentUpsampler()
+
+        if weights_path.exists():
+            weights = load_split_safetensors(weights_path, prefix=f"{name}.")
+            self.upsampler.load_weights(list(weights.items()))
+        aggressive_cleanup()
 
     def load(self) -> None:
         """Load all components including upsampler."""
         super().load()
 
         if self.upsampler is None:
-            self.upsampler = LatentUpsampler()
-            # Load upsampler weights if available
-            upsampler_path = self.model_dir / "upsampler.safetensors"
-            if upsampler_path.exists():
-                weights = load_split_safetensors(upsampler_path)
-                self.upsampler.load_weights(list(weights.items()))
-            aggressive_cleanup()
+            self._load_upsampler()
 
     def generate_two_stage(
         self,
