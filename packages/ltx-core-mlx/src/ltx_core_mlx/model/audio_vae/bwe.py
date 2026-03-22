@@ -144,12 +144,16 @@ class MelSTFT(nn.Module):
         mel_basis                   — (64, 257)
         stft_fn.forward_basis       — (514, 1, 512)
         stft_fn.inverse_basis       — (514, 1, 512)
+
+    Note: hop_length=80 matches the BWE config (not 160 from the audio VAE
+    preprocessing). This ensures BWE generator output length matches the
+    3x-resampled skip connection: mel_frames * 240 == vocoder_output * 3.
     """
 
     def __init__(
         self,
         n_fft: int = 512,
-        hop_length: int = 160,
+        hop_length: int = 80,
         n_mels: int = 64,
     ):
         super().__init__()
@@ -177,7 +181,7 @@ class MelSTFT(nn.Module):
         x = waveform[:, :, None]
 
         # Causal padding: left-only, matching reference _STFTFn
-        left_pad = max(0, self.n_fft - self.hop_length)  # 512 - 160 = 352
+        left_pad = max(0, self.n_fft - self.hop_length)  # 512 - 80 = 432
         x = mx.pad(x, [(0, 0), (left_pad, 0), (0, 0)])
 
         # Apply STFT basis via conv1d
