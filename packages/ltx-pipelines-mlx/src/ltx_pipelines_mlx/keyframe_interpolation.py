@@ -15,7 +15,7 @@ from ltx_core_mlx.utils.memory import aggressive_cleanup
 from ltx_core_mlx.utils.positions import compute_audio_positions, compute_audio_token_count, compute_video_positions
 from ltx_pipelines_mlx.denoise import denoise_loop
 from ltx_pipelines_mlx.scheduler import DISTILLED_SIGMAS
-from ltx_pipelines_mlx.text_to_video import TextToVideoPipeline
+from ltx_pipelines_mlx.ti2vid_one_stage import TextToVideoPipeline
 
 
 class KeyframeInterpolationPipeline(TextToVideoPipeline):
@@ -89,11 +89,7 @@ class KeyframeInterpolationPipeline(TextToVideoPipeline):
         if self.low_memory:
             aggressive_cleanup()
 
-        # TODO(Task 8): attention mask is now built inside kf_condition.apply()
-        # and stored in video_state.attention_mask. Wire it into denoise_loop.
-        video_attn_mask = None
-
-        # Denoise
+        # Denoise — attention mask is resolved from video_state automatically
         sigmas = DISTILLED_SIGMAS[: num_steps + 1] if num_steps else DISTILLED_SIGMAS
         x0_model = X0Model(self.dit)
 
@@ -104,7 +100,6 @@ class KeyframeInterpolationPipeline(TextToVideoPipeline):
             video_text_embeds=video_embeds,
             audio_text_embeds=audio_embeds,
             sigmas=sigmas,
-            video_attention_mask=video_attn_mask,
         )
         if self.low_memory:
             aggressive_cleanup()

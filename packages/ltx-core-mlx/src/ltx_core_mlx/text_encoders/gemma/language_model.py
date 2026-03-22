@@ -5,6 +5,7 @@ Ported from ltx-core/src/ltx_core/text_encoders/gemma/language_model.py
 
 from __future__ import annotations
 
+import functools
 from pathlib import Path
 
 import mlx.core as mx
@@ -181,3 +182,116 @@ class GemmaLanguageModel(nn.Module):
         token_ids, attention_mask = self.tokenize(text, max_length)
         hidden_states = self.get_all_hidden_states(token_ids, attention_mask=attention_mask)
         return hidden_states, attention_mask
+
+    # --- Prompt enhancement ---
+
+    def enhance_t2v(
+        self,
+        prompt: str,
+        max_new_tokens: int = 512,
+        system_prompt: str | None = None,
+        seed: int = 10,
+    ) -> str:
+        """Enhance a text prompt for T2V generation using Gemma.
+
+        Args:
+            prompt: Raw user prompt.
+            max_new_tokens: Maximum tokens to generate.
+            system_prompt: Custom system prompt (uses default T2V prompt if None).
+            seed: Random seed for generation.
+
+        Returns:
+            Enhanced prompt string.
+        """
+        system_prompt = system_prompt or self.default_gemma_t2v_system_prompt
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"user prompt: {prompt}"},
+        ]
+        return self._enhance(messages, max_new_tokens=max_new_tokens, seed=seed)
+
+    def enhance_i2v(
+        self,
+        prompt: str,
+        max_new_tokens: int = 512,
+        system_prompt: str | None = None,
+        seed: int = 10,
+    ) -> str:
+        """Enhance a text prompt for I2V generation using Gemma.
+
+        Note: Unlike the reference implementation, this does not pass the image
+        to Gemma (mlx-lm does not support multimodal generation). The system
+        prompt still instructs Gemma to write an I2V-style prompt.
+
+        Args:
+            prompt: Raw user prompt.
+            max_new_tokens: Maximum tokens to generate.
+            system_prompt: Custom system prompt (uses default I2V prompt if None).
+            seed: Random seed for generation.
+
+        Returns:
+            Enhanced prompt string.
+        """
+        system_prompt = system_prompt or self.default_gemma_i2v_system_prompt
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"User Raw Input Prompt: {prompt}."},
+        ]
+        return self._enhance(messages, max_new_tokens=max_new_tokens, seed=seed)
+
+    def _enhance(
+        self,
+        messages: list[dict[str, str]],
+        max_new_tokens: int = 512,
+        seed: int = 10,
+    ) -> str:
+        """Generate an enhanced prompt from chat messages.
+
+        Args:
+            messages: Chat-formatted messages (system + user).
+            max_new_tokens: Maximum tokens to generate.
+            seed: Random seed.
+
+        Returns:
+            Generated text.
+        """
+        if self._model is None or self._tokenizer is None:
+            raise RuntimeError("Model not loaded. Call load() first.")
+
+        from mlx_lm import generate as mlx_generate
+
+        # Format as chat template
+        chat_text = self._tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
+        mx.random.seed(seed)
+        result = mlx_generate(
+            model=self._model,
+            tokenizer=self._tokenizer,
+            prompt=chat_text,
+            max_tokens=max_new_tokens,
+            temp=0.7,
+            verbose=False,
+        )
+        return result.strip()
+
+    @functools.cached_property
+    def default_gemma_t2v_system_prompt(self) -> str:
+        """Load the default T2V system prompt."""
+        return _load_system_prompt("gemma_t2v_system_prompt.txt")
+
+    @functools.cached_property
+    def default_gemma_i2v_system_prompt(self) -> str:
+        """Load the default I2V system prompt."""
+        return _load_system_prompt("gemma_i2v_system_prompt.txt")
+
+
+@functools.lru_cache(maxsize=2)
+def _load_system_prompt(prompt_name: str) -> str:
+    """Load a system prompt file from the prompts directory."""
+    prompt_path = Path(__file__).parent / "prompts" / prompt_name
+    with open(prompt_path) as f:
+        return f.read()

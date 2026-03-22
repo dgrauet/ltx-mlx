@@ -20,7 +20,7 @@ from ltx_core_mlx.utils.positions import compute_audio_positions, compute_audio_
 from ltx_core_mlx.utils.weights import load_split_safetensors, remap_audio_vae_keys
 from ltx_pipelines_mlx.denoise import denoise_loop
 from ltx_pipelines_mlx.scheduler import DISTILLED_SIGMAS, STAGE_2_SIGMAS
-from ltx_pipelines_mlx.text_to_video import TextToVideoPipeline
+from ltx_pipelines_mlx.ti2vid_one_stage import TextToVideoPipeline
 
 
 class AudioToVideoPipeline(TextToVideoPipeline):

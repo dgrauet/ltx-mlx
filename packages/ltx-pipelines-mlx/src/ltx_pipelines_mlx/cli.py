@@ -3,6 +3,9 @@
 Usage:
     ltx-2-mlx generate --prompt "a cat walking" --output out.mp4
     ltx-2-mlx generate --prompt "animate this" --image photo.jpg --output out.mp4
+    ltx-2-mlx generate --prompt "a scene" --two-stage --output hires.mp4
+    ltx-2-mlx generate --prompt "a scene" --hq --output hq.mp4
+    ltx-2-mlx enhance --prompt "a cat" --mode t2v
     ltx-2-mlx info --model dgrauet/ltx-2.3-mlx-distilled-q8
 """
 
@@ -27,6 +30,9 @@ examples:
   ltx-2-mlx generate --prompt "a sunset over the ocean" --output sunset.mp4
   ltx-2-mlx generate --prompt "animate" --image photo.jpg -o anim.mp4
   ltx-2-mlx generate --prompt "a cat" -o cat.mp4 --height 320 --width 512 --frames 25
+  ltx-2-mlx generate --prompt "a scene" --two-stage -o hires.mp4
+  ltx-2-mlx generate --prompt "a scene" --hq --stage1-steps 20 -o hq.mp4
+  ltx-2-mlx enhance --prompt "a cat walking" --mode t2v
   ltx-2-mlx info --model dgrauet/ltx-2.3-mlx-distilled-q4
 """,
     )
@@ -48,6 +54,18 @@ examples:
     gen.add_argument("--steps", type=int, default=None, help="Denoising steps (default: 8)")
     gen.add_argument("--no-audio", action="store_true", help="Skip audio generation")
     gen.add_argument("--quiet", "-q", action="store_true", help="Suppress progress output")
+    gen.add_argument("--two-stage", action="store_true", help="Use two-stage pipeline (half-res + upscale + refine)")
+    gen.add_argument("--hq", action="store_true", help="Use HQ pipeline (res_2s sampler + upscale + refine)")
+    gen.add_argument("--stage1-steps", type=int, default=None, help="Stage 1 steps for two-stage/HQ mode")
+    gen.add_argument("--stage2-steps", type=int, default=None, help="Stage 2 steps for two-stage/HQ mode")
+    gen.add_argument("--enhance-prompt", action="store_true", help="Enhance prompt using Gemma before generation")
+
+    # --- enhance ---
+    enh = sub.add_parser("enhance", help="Enhance a prompt using Gemma (no video generation)")
+    enh.add_argument("--prompt", "-p", required=True, help="Prompt to enhance")
+    enh.add_argument("--mode", choices=["t2v", "i2v"], default="t2v", help="Prompt mode (default: t2v)")
+    enh.add_argument("--gemma", default=DEFAULT_GEMMA, help=f"Gemma model (default: {DEFAULT_GEMMA})")
+    enh.add_argument("--seed", "-s", type=int, default=10, help="Random seed (default: 10)")
 
     # --- info ---
     info = sub.add_parser("info", help="Show model info and memory estimate")
@@ -61,6 +79,8 @@ examples:
 
     if args.command == "generate":
         _cmd_generate(args)
+    elif args.command == "enhance":
+        _cmd_enhance(args)
     elif args.command == "info":
         _cmd_info(args)
 
@@ -69,8 +89,65 @@ def _cmd_generate(args: argparse.Namespace) -> None:
     """Generate a video from a text prompt (and optionally a reference image)."""
     t0 = time.time()
 
-    if args.image:
-        from ltx_pipelines_mlx.image_to_video import ImageToVideoPipeline
+    # Enhance prompt if requested
+    prompt = args.prompt
+    if args.enhance_prompt:
+        from ltx_core_mlx.text_encoders.gemma.language_model import GemmaLanguageModel
+
+        if not args.quiet:
+            print("Enhancing prompt...")
+        gemma = GemmaLanguageModel()
+        gemma.load(args.gemma)
+        if args.image:
+            prompt = gemma.enhance_i2v(prompt, seed=args.seed)
+        else:
+            prompt = gemma.enhance_t2v(prompt, seed=args.seed)
+        if not args.quiet:
+            print(f"Enhanced: {prompt[:200]}...")
+        del gemma
+        from ltx_core_mlx.utils.memory import aggressive_cleanup
+
+        aggressive_cleanup()
+
+    if args.hq:
+        from ltx_pipelines_mlx.ti2vid_two_stages_hq import TwoStageHQPipeline
+
+        if not args.quiet:
+            print("Mode: HQ Two-Stage (res_2s)")
+
+        pipe = TwoStageHQPipeline(model_dir=args.model, low_memory=True)
+        video_latent, audio_latent = pipe.generate_hq(
+            prompt=prompt,
+            height=args.height,
+            width=args.width,
+            num_frames=args.frames,
+            seed=args.seed,
+            stage1_steps=args.stage1_steps or 20,
+            stage2_steps=args.stage2_steps,
+            image=args.image,
+        )
+        _decode_and_save(pipe, video_latent, audio_latent, args)
+
+    elif args.two_stage:
+        from ltx_pipelines_mlx.ti2vid_two_stages import TwoStagePipeline
+
+        if not args.quiet:
+            print("Mode: Two-Stage")
+
+        pipe = TwoStagePipeline(model_dir=args.model, low_memory=True)
+        video_latent, audio_latent = pipe.generate_two_stage(
+            prompt=prompt,
+            height=args.height,
+            width=args.width,
+            num_frames=args.frames,
+            seed=args.seed,
+            stage1_steps=args.stage1_steps,
+            stage2_steps=args.stage2_steps,
+        )
+        _decode_and_save(pipe, video_latent, audio_latent, args)
+
+    elif args.image:
+        from ltx_pipelines_mlx.i2vid_one_stage import ImageToVideoPipeline
 
         if not args.quiet:
             print("Mode: Image-to-Video")
@@ -78,7 +155,7 @@ def _cmd_generate(args: argparse.Namespace) -> None:
 
         pipe = ImageToVideoPipeline(model_dir=args.model, gemma_model_id=args.gemma)
         output = pipe.generate_and_save(
-            prompt=args.prompt,
+            prompt=prompt,
             output_path=args.output,
             image=args.image,
             height=args.height,
@@ -87,15 +164,17 @@ def _cmd_generate(args: argparse.Namespace) -> None:
             seed=args.seed,
             num_steps=args.steps,
         )
+        _print_result(output, t0, args.quiet)
+        return
     else:
-        from ltx_pipelines_mlx.text_to_video import TextToVideoPipeline
+        from ltx_pipelines_mlx.ti2vid_one_stage import TextToVideoPipeline
 
         if not args.quiet:
             print("Mode: Text-to-Video")
 
         pipe = TextToVideoPipeline(model_dir=args.model, gemma_model_id=args.gemma)
         output = pipe.generate_and_save(
-            prompt=args.prompt,
+            prompt=prompt,
             output_path=args.output,
             height=args.height,
             width=args.width,
@@ -103,12 +182,70 @@ def _cmd_generate(args: argparse.Namespace) -> None:
             seed=args.seed,
             num_steps=args.steps,
         )
+        _print_result(output, t0, args.quiet)
+        return
 
+    _print_result(args.output, t0, args.quiet)
+
+
+def _decode_and_save(
+    pipe: object,
+    video_latent: object,
+    audio_latent: object,
+    args: argparse.Namespace,
+) -> None:
+    """Decode latents and save to file (shared by two-stage pipelines)."""
+    import tempfile
+    from pathlib import Path
+
+    from ltx_core_mlx.utils.memory import aggressive_cleanup
+
+    # Free transformer to make room for VAE decode
+    if hasattr(pipe, "low_memory") and pipe.low_memory:
+        pipe.dit = None
+        pipe.text_encoder = None
+        pipe.feature_extractor = None
+        pipe._loaded = False
+        aggressive_cleanup()
+
+    assert pipe.audio_decoder is not None
+    assert pipe.vocoder is not None
+    mel = pipe.audio_decoder.decode(audio_latent)
+    waveform = pipe.vocoder(mel)
+    aggressive_cleanup()
+
+    audio_path = tempfile.mktemp(suffix=".wav")
+    pipe._save_waveform(waveform, audio_path, sample_rate=48000)
+
+    assert pipe.vae_decoder is not None
+    pipe.vae_decoder.decode_and_stream(video_latent, args.output, fps=24.0, audio_path=audio_path)
+    Path(audio_path).unlink(missing_ok=True)
+    aggressive_cleanup()
+
+
+def _print_result(output: str, t0: float, quiet: bool) -> None:
+    """Print generation result."""
     elapsed = time.time() - t0
-
-    if not args.quiet:
+    if not quiet:
         print(f"\nSaved to: {output}")
         print(f"Time: {elapsed:.1f}s")
+
+
+def _cmd_enhance(args: argparse.Namespace) -> None:
+    """Enhance a prompt using Gemma."""
+    from ltx_core_mlx.text_encoders.gemma.language_model import GemmaLanguageModel
+
+    print("Loading Gemma...")
+    gemma = GemmaLanguageModel()
+    gemma.load(args.gemma)
+
+    if args.mode == "t2v":
+        enhanced = gemma.enhance_t2v(args.prompt, seed=args.seed)
+    else:
+        enhanced = gemma.enhance_i2v(args.prompt, seed=args.seed)
+
+    print(f"\nOriginal: {args.prompt}")
+    print(f"\nEnhanced: {enhanced}")
 
 
 def _cmd_info(args: argparse.Namespace) -> None:
