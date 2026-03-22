@@ -199,8 +199,8 @@ class RetakePipeline(TextToVideoPipeline):
 
         # Audio state: apply same temporal mask to audio
         audio_tokens_per_video_frame = audio_T / F
-        audio_start = int(start_frame * audio_tokens_per_video_frame)
-        audio_end = int(end_frame * audio_tokens_per_video_frame)
+        audio_start = round(start_frame * audio_tokens_per_video_frame)
+        audio_end = round(end_frame * audio_tokens_per_video_frame)
 
         audio_mask = mx.zeros((1, audio_T, 1), dtype=mx.bfloat16)
         audio_mask = audio_mask.at[:, audio_start:audio_end, :].add(

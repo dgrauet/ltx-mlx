@@ -10,7 +10,7 @@ from pathlib import Path
 import mlx.core as mx
 
 from ltx_core_mlx.components.patchifiers import compute_video_latent_shape
-from ltx_core_mlx.conditioning.types.latent_cond import LatentState, create_initial_state
+from ltx_core_mlx.conditioning.types.latent_cond import LatentState
 from ltx_core_mlx.model.audio_vae import AudioProcessor, AudioVAEEncoder, encode_audio
 from ltx_core_mlx.model.transformer.model import X0Model
 from ltx_core_mlx.model.video_vae.video_vae import VideoEncoder
@@ -208,7 +208,7 @@ class ExtendPipeline(TextToVideoPipeline):
         # Compute positions for RoPE
         video_positions = compute_video_positions(F_total, H, W)
         audio_tokens, audio_T = self.audio_patchifier.patchify(source_audio_latent)
-        extend_audio_T = int(audio_T * extend_frames / F_source)
+        extend_audio_T = round(audio_T * extend_frames / F_source)
         audio_total_T = audio_T + extend_audio_T
         audio_positions = compute_audio_positions(audio_total_T)
 
@@ -219,8 +219,35 @@ class ExtendPipeline(TextToVideoPipeline):
             positions=video_positions,
         )
 
-        # Audio: extend proportionally
-        audio_state = create_initial_state((B, audio_total_T, 128), seed + 1, positions=audio_positions)
+        # Audio: preserve source audio, extend with noise
+        mx.random.seed(seed + 1)
+        new_audio_noise = mx.random.normal((B, extend_audio_T, 128)).astype(mx.bfloat16)
+
+        if direction == "after":
+            audio_combined = mx.concatenate([audio_tokens, new_audio_noise], axis=1)
+            audio_denoise_mask = mx.concatenate(
+                [
+                    mx.zeros((B, audio_T, 1), dtype=mx.bfloat16),
+                    mx.ones((B, extend_audio_T, 1), dtype=mx.bfloat16),
+                ],
+                axis=1,
+            )
+        else:  # before
+            audio_combined = mx.concatenate([new_audio_noise, audio_tokens], axis=1)
+            audio_denoise_mask = mx.concatenate(
+                [
+                    mx.ones((B, extend_audio_T, 1), dtype=mx.bfloat16),
+                    mx.zeros((B, audio_T, 1), dtype=mx.bfloat16),
+                ],
+                axis=1,
+            )
+
+        audio_state = LatentState(
+            latent=audio_combined,
+            clean_latent=audio_combined * (1.0 - audio_denoise_mask),
+            denoise_mask=audio_denoise_mask,
+            positions=audio_positions,
+        )
 
         # Text encoding
         video_embeds, audio_embeds = self._encode_text(prompt)

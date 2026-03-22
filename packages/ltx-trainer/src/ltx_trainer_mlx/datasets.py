@@ -30,6 +30,7 @@ class DummyDataset:
         latent_spatial_compression_ratio: int = 32,
         latent_temporal_compression_ratio: int = 8,
         prompt_embed_dim: int = 4096,
+        audio_embed_dim: int = 2048,
         prompt_sequence_length: int = 256,
     ) -> None:
         if width % 32 != 0:
@@ -52,6 +53,7 @@ class DummyDataset:
         self.latent_width = width // latent_spatial_compression_ratio
         self.latent_sequence_length = self.num_latent_frames * self.latent_height * self.latent_width
         self.prompt_embed_dim = prompt_embed_dim
+        self.audio_embed_dim = audio_embed_dim
         self.prompt_sequence_length = prompt_sequence_length
 
     def __len__(self) -> int:
@@ -92,7 +94,7 @@ class DummyDataset:
                 "audio_prompt_embeds": mx.random.normal(
                     shape=(
                         self.prompt_sequence_length,
-                        self.prompt_embed_dim,
+                        self.audio_embed_dim,
                     )
                 ),
                 "prompt_attention_mask": mx.ones(
