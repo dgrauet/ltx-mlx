@@ -37,8 +37,8 @@ class TestFullGeneration:
         from ltx_core_mlx.model.transformer.model import LTXModel, LTXModelConfig, X0Model
         from ltx_core_mlx.model.video_vae.video_vae import VideoDecoder
         from ltx_core_mlx.utils.weights import apply_quantization, load_split_safetensors, remap_audio_vae_keys
-        from ltx_pipelines_mlx.denoise import denoise_loop
         from ltx_pipelines_mlx.scheduler import DISTILLED_SIGMAS
+        from ltx_pipelines_mlx.utils.samplers import denoise_loop
 
         # ---- Parameters ----
         seed = 42

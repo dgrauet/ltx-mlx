@@ -4,7 +4,7 @@ import math
 
 import mlx.core as mx
 
-from ltx_pipelines_mlx.denoise import (
+from ltx_pipelines_mlx.utils.samplers import (
     _compute_per_token_timesteps,
     _is_uniform_mask,
     _res2s_coefficients,

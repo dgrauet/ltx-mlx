@@ -42,8 +42,8 @@ class TestRealPromptGeneration:
         from ltx_core_mlx.text_encoders.gemma.language_model import GemmaLanguageModel
         from ltx_core_mlx.utils.positions import compute_audio_positions, compute_video_positions
         from ltx_core_mlx.utils.weights import apply_quantization, load_split_safetensors, remap_audio_vae_keys
-        from ltx_pipelines_mlx.denoise import denoise_loop
         from ltx_pipelines_mlx.scheduler import DISTILLED_SIGMAS
+        from ltx_pipelines_mlx.utils.samplers import denoise_loop
 
         prompt = "A cat playing piano in a jazz club, cinematic lighting"
         F, H, W = 2, 2, 3

@@ -38,8 +38,8 @@ class TestGenerateWithRoPE:
         from ltx_core_mlx.model.video_vae.video_vae import VideoDecoder
         from ltx_core_mlx.utils.positions import compute_audio_positions, compute_video_positions
         from ltx_core_mlx.utils.weights import apply_quantization, load_split_safetensors, remap_audio_vae_keys
-        from ltx_pipelines_mlx.denoise import denoise_loop
         from ltx_pipelines_mlx.scheduler import DISTILLED_SIGMAS
+        from ltx_pipelines_mlx.utils.samplers import denoise_loop
 
         # Small but realistic latent dimensions
         # 2 frames x 2x3 spatial = 12 video tokens

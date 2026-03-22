@@ -13,9 +13,9 @@ from ltx_core_mlx.model.transformer.model import X0Model
 from ltx_core_mlx.model.video_vae.patchifier import compute_video_latent_shape
 from ltx_core_mlx.utils.memory import aggressive_cleanup
 from ltx_core_mlx.utils.positions import compute_audio_positions, compute_audio_token_count, compute_video_positions
-from ltx_pipelines_mlx.denoise import denoise_loop
 from ltx_pipelines_mlx.scheduler import DISTILLED_SIGMAS
 from ltx_pipelines_mlx.ti2vid_one_stage import TextToVideoPipeline
+from ltx_pipelines_mlx.utils.samplers import denoise_loop
 
 
 class KeyframeInterpolationPipeline(TextToVideoPipeline):
