@@ -10,7 +10,14 @@ from dataclasses import dataclass
 import mlx.core as mx
 from tqdm import tqdm
 
+from ltx_core_mlx.components.guiders import MultiModalGuiderFactory
 from ltx_core_mlx.conditioning.types.latent_cond import LatentState, apply_denoise_mask
+from ltx_core_mlx.guidance.perturbations import (
+    BatchedPerturbationConfig,
+    Perturbation,
+    PerturbationConfig,
+    PerturbationType,
+)
 from ltx_core_mlx.model.transformer.model import X0Model
 from ltx_core_mlx.utils.memory import aggressive_cleanup
 from ltx_pipelines_mlx.scheduler import DISTILLED_SIGMAS
@@ -352,4 +359,233 @@ def res2s_denoise_loop(
         mx.eval(video_x, audio_x)
 
     aggressive_cleanup()
+    return DenoiseOutput(video_latent=video_x, audio_latent=audio_x)
+
+
+# --- Guided denoising with CFG/STG/modality guidance ---
+
+
+def guided_denoise_loop(
+    model: X0Model,
+    video_state: LatentState,
+    audio_state: LatentState,
+    video_text_embeds: mx.array,
+    audio_text_embeds: mx.array,
+    video_guider_factory: MultiModalGuiderFactory,
+    audio_guider_factory: MultiModalGuiderFactory | None = None,
+    sigmas: list[float] | None = None,
+    video_positions: mx.array | None = None,
+    audio_positions: mx.array | None = None,
+    video_attention_mask: mx.array | None = None,
+    audio_attention_mask: mx.array | None = None,
+    show_progress: bool = True,
+) -> DenoiseOutput:
+    """Run the Euler denoising loop with multi-modal guidance (CFG/STG).
+
+    This extends denoise_loop() with classifier-free guidance (CFG),
+    spatio-temporal guidance (STG), and modality guidance. For each step,
+    depending on the guider configuration:
+
+    1. Run the model with positive (conditioned) context.
+    2. Optionally run with negative (unconditioned) context for CFG.
+    3. Optionally run with perturbed attention for STG.
+    4. Optionally run with isolated modality for modality guidance.
+    5. Combine predictions using the guider's calculate() method.
+    6. Apply the Euler step as usual.
+
+    Args:
+        model: X0Model wrapping the LTXModel.
+        video_state: Video latent state.
+        audio_state: Audio latent state.
+        video_text_embeds: Positive text embeddings for video conditioning.
+        audio_text_embeds: Positive text embeddings for audio conditioning.
+        video_guider_factory: Factory producing video guiders per sigma.
+        audio_guider_factory: Factory producing audio guiders per sigma.
+            If None, uses video_guider_factory for audio as well.
+        sigmas: Sigma schedule (defaults to DISTILLED_SIGMAS).
+        video_positions: Positional embeddings for video.
+        audio_positions: Positional embeddings for audio.
+        video_attention_mask: Attention mask for video.
+        audio_attention_mask: Attention mask for audio.
+        show_progress: Whether to show tqdm progress bar.
+
+    Returns:
+        DenoiseOutput with final video and audio latents.
+    """
+    if sigmas is None:
+        sigmas = DISTILLED_SIGMAS
+
+    if audio_guider_factory is None:
+        audio_guider_factory = video_guider_factory
+
+    # Resolve positions: explicit params override, then fall back to state
+    if video_positions is None and video_state.positions is not None:
+        video_positions = video_state.positions
+    if audio_positions is None and audio_state.positions is not None:
+        audio_positions = audio_state.positions
+
+    # Resolve attention masks from state
+    if video_attention_mask is None and video_state.attention_mask is not None:
+        video_attention_mask = video_state.attention_mask
+    if audio_attention_mask is None and audio_state.attention_mask is not None:
+        audio_attention_mask = audio_state.attention_mask
+
+    video_x = video_state.latent
+    audio_x = audio_state.latent
+
+    steps = list(zip(sigmas[:-1], sigmas[1:]))
+    iterator = tqdm(steps, desc="Denoising (guided)", disable=not show_progress)
+
+    # Determine whether we need per-token timesteps (for conditioning masks).
+    video_uniform = _is_uniform_mask(video_state.denoise_mask)
+    audio_uniform = _is_uniform_mask(audio_state.denoise_mask)
+
+    # Track last denoised for skip_step
+    last_video_x0: mx.array | None = None
+    last_audio_x0: mx.array | None = None
+
+    for step_idx, (sigma, sigma_next) in enumerate(iterator):
+        # Build guiders for this sigma level
+        video_guider = video_guider_factory.build_from_sigma(sigma)
+        audio_guider = audio_guider_factory.build_from_sigma(sigma)
+
+        # Check if both guiders want to skip this step
+        if (
+            video_guider.should_skip_step(step_idx)
+            and audio_guider.should_skip_step(step_idx)
+            and last_video_x0 is not None
+            and last_audio_x0 is not None
+        ):
+            video_x = euler_step(video_x, last_video_x0, sigma, sigma_next)
+            audio_x = euler_step(audio_x, last_audio_x0, sigma, sigma_next)
+            mx.async_eval(video_x, audio_x)
+            continue
+
+        # Build common model kwargs
+        sigma_arr = mx.array([sigma], dtype=mx.bfloat16)
+        B = video_x.shape[0]
+
+        base_kwargs: dict = dict(
+            video_latent=video_x,
+            audio_latent=audio_x,
+            sigma=mx.broadcast_to(sigma_arr, (B,)),
+            video_positions=video_positions,
+            audio_positions=audio_positions,
+            video_attention_mask=video_attention_mask,
+            audio_attention_mask=audio_attention_mask,
+        )
+
+        # Per-token timesteps for conditioning
+        if not video_uniform:
+            base_kwargs["video_timesteps"] = _compute_per_token_timesteps(sigma, video_state.denoise_mask)
+        if not audio_uniform:
+            base_kwargs["audio_timesteps"] = _compute_per_token_timesteps(sigma, audio_state.denoise_mask)
+
+        # --- 1. Conditioned prediction (positive context) ---
+        cond_kwargs = {
+            **base_kwargs,
+            "video_text_embeds": video_text_embeds,
+            "audio_text_embeds": audio_text_embeds,
+        }
+        cond_video_x0, cond_audio_x0 = model(**cond_kwargs)
+
+        # --- 2. Unconditional prediction for CFG ---
+        neg_video_x0: mx.array | float = 0.0
+        neg_audio_x0: mx.array | float = 0.0
+
+        if video_guider.do_unconditional_generation() or audio_guider.do_unconditional_generation():
+            # Use negative context from guiders, or fall back to positive
+            neg_video_embeds = (
+                video_guider.negative_context if video_guider.negative_context is not None else video_text_embeds
+            )
+            neg_audio_embeds = (
+                audio_guider.negative_context if audio_guider.negative_context is not None else audio_text_embeds
+            )
+
+            neg_kwargs = {
+                **base_kwargs,
+                "video_text_embeds": neg_video_embeds,
+                "audio_text_embeds": neg_audio_embeds,
+            }
+            neg_video_x0, neg_audio_x0 = model(**neg_kwargs)
+
+        # --- 3. Perturbed prediction for STG ---
+        ptb_video_x0: mx.array | float = 0.0
+        ptb_audio_x0: mx.array | float = 0.0
+
+        if video_guider.do_perturbed_generation() or audio_guider.do_perturbed_generation():
+            perturbation_list: list[Perturbation] = []
+            if video_guider.do_perturbed_generation():
+                perturbation_list.append(
+                    Perturbation(
+                        type=PerturbationType.SKIP_VIDEO_SELF_ATTN,
+                        blocks=video_guider.params.stg_blocks,
+                    )
+                )
+            if audio_guider.do_perturbed_generation():
+                perturbation_list.append(
+                    Perturbation(
+                        type=PerturbationType.SKIP_AUDIO_SELF_ATTN,
+                        blocks=audio_guider.params.stg_blocks,
+                    )
+                )
+            perturbation_config = PerturbationConfig(perturbations=perturbation_list)
+            batched_perturbations = BatchedPerturbationConfig(perturbations=[perturbation_config] * B)
+
+            ptb_kwargs = {
+                **base_kwargs,
+                "video_text_embeds": video_text_embeds,
+                "audio_text_embeds": audio_text_embeds,
+                "perturbations": batched_perturbations,
+            }
+            ptb_video_x0, ptb_audio_x0 = model(**ptb_kwargs)
+
+        # --- 4. Isolated modality prediction ---
+        mod_video_x0: mx.array | float = 0.0
+        mod_audio_x0: mx.array | float = 0.0
+
+        if video_guider.do_isolated_modality_generation() or audio_guider.do_isolated_modality_generation():
+            mod_perturbation_list = [
+                Perturbation(type=PerturbationType.SKIP_A2V_CROSS_ATTN, blocks=None),
+                Perturbation(type=PerturbationType.SKIP_V2A_CROSS_ATTN, blocks=None),
+            ]
+            mod_perturbation_config = PerturbationConfig(perturbations=mod_perturbation_list)
+            mod_batched_perturbations = BatchedPerturbationConfig(perturbations=[mod_perturbation_config] * B)
+
+            mod_kwargs = {
+                **base_kwargs,
+                "video_text_embeds": video_text_embeds,
+                "audio_text_embeds": audio_text_embeds,
+                "perturbations": mod_batched_perturbations,
+            }
+            mod_video_x0, mod_audio_x0 = model(**mod_kwargs)
+
+        # --- 5. Apply guiders ---
+        if video_guider.should_skip_step(step_idx) and last_video_x0 is not None:
+            video_x0 = last_video_x0
+        else:
+            video_x0 = video_guider.calculate(cond_video_x0, neg_video_x0, ptb_video_x0, mod_video_x0)
+
+        if audio_guider.should_skip_step(step_idx) and last_audio_x0 is not None:
+            audio_x0 = last_audio_x0
+        else:
+            audio_x0 = audio_guider.calculate(cond_audio_x0, neg_audio_x0, ptb_audio_x0, mod_audio_x0)
+
+        # Apply denoise mask: blend with clean latent
+        video_x0 = apply_denoise_mask(video_x0, video_state.clean_latent, video_state.denoise_mask)
+        audio_x0 = apply_denoise_mask(audio_x0, audio_state.clean_latent, audio_state.denoise_mask)
+
+        # Track for skip_step
+        last_video_x0 = video_x0
+        last_audio_x0 = audio_x0
+
+        # Euler step
+        video_x = euler_step(video_x, video_x0, sigma, sigma_next)
+        audio_x = euler_step(audio_x, audio_x0, sigma, sigma_next)
+
+        # Force computation for memory efficiency
+        mx.async_eval(video_x, audio_x)
+
+    aggressive_cleanup()
+
     return DenoiseOutput(video_latent=video_x, audio_latent=audio_x)

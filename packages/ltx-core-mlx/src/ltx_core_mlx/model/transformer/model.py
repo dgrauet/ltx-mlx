@@ -23,6 +23,7 @@ from enum import Enum
 import mlx.core as mx
 import mlx.nn as nn
 
+from ltx_core_mlx.guidance.perturbations import BatchedPerturbationConfig
 from ltx_core_mlx.model.transformer.adaln import AdaLayerNormSingle
 from ltx_core_mlx.model.transformer.timestep_embedding import get_timestep_embedding
 from ltx_core_mlx.model.transformer.transformer import BasicAVTransformerBlock
@@ -182,6 +183,7 @@ class LTXModel(nn.Module):
         audio_attention_mask: mx.array | None = None,
         video_timesteps: mx.array | None = None,
         audio_timesteps: mx.array | None = None,
+        perturbations: BatchedPerturbationConfig | None = None,
     ) -> tuple[mx.array, mx.array]:
         """Forward pass.
 
@@ -200,6 +202,7 @@ class LTXModel(nn.Module):
                 of per-batch, enabling preserved tokens (mask=0) to receive
                 timestep=0 (no modulation).
             audio_timesteps: Optional (B, Na) per-token timesteps for audio.
+            perturbations: Optional perturbation config for STG guidance.
 
         Returns:
             Tuple of (video_velocity, audio_velocity), same shapes as inputs.
@@ -297,7 +300,7 @@ class LTXModel(nn.Module):
             )
 
         # Transformer blocks
-        for block in self.transformer_blocks:
+        for block_idx, block in enumerate(self.transformer_blocks):
             video_hidden, audio_hidden = block(
                 video_hidden=video_hidden,
                 audio_hidden=audio_hidden,
@@ -317,6 +320,8 @@ class LTXModel(nn.Module):
                 audio_cross_rope_freqs=audio_cross_rope_freqs,
                 video_attention_mask=video_attention_mask,
                 audio_attention_mask=audio_attention_mask,
+                perturbations=perturbations,
+                block_idx=block_idx,
             )
 
         # Output: AdaLN with scale_shift_table + embedded_timestep + proj
@@ -406,6 +411,7 @@ class X0Model(nn.Module):
         sigma: mx.array,
         video_timesteps: mx.array | None = None,
         audio_timesteps: mx.array | None = None,
+        perturbations: BatchedPerturbationConfig | None = None,
         **kwargs,
     ) -> tuple[mx.array, mx.array]:
         """Predict x0 from noisy input.
@@ -419,6 +425,7 @@ class X0Model(nn.Module):
             sigma: Current noise level (B,).
             video_timesteps: Optional per-token timesteps (B, Nv).
             audio_timesteps: Optional per-token timesteps (B, Na).
+            perturbations: Optional perturbation config for STG guidance.
             **kwargs: Passed to inner model.
 
         Returns:
@@ -430,6 +437,7 @@ class X0Model(nn.Module):
             timestep=sigma,
             video_timesteps=video_timesteps,
             audio_timesteps=audio_timesteps,
+            perturbations=perturbations,
             **kwargs,
         )
 

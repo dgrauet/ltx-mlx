@@ -1,4 +1,4 @@
-"""Guidance systems for diffusion generation."""
+"""Diffusion components: guiders, schedulers, diffusion steps."""
 
 from ltx_core_mlx.components.guiders import (
     MultiModalGuider,
@@ -7,21 +7,11 @@ from ltx_core_mlx.components.guiders import (
     create_multimodal_guider_factory,
     projection_coef,
 )
-from ltx_core_mlx.guidance.perturbations import (
-    BatchedPerturbationConfig,
-    Perturbation,
-    PerturbationConfig,
-    PerturbationType,
-)
 
 __all__ = [
-    "BatchedPerturbationConfig",
     "MultiModalGuider",
     "MultiModalGuiderFactory",
     "MultiModalGuiderParams",
-    "Perturbation",
-    "PerturbationConfig",
-    "PerturbationType",
     "create_multimodal_guider_factory",
     "projection_coef",
 ]

@@ -21,6 +21,7 @@ from __future__ import annotations
 import mlx.core as mx
 import mlx.nn as nn
 
+from ltx_core_mlx.guidance.perturbations import BatchedPerturbationConfig, PerturbationType
 from ltx_core_mlx.model.transformer.attention import Attention
 from ltx_core_mlx.model.transformer.feed_forward import FeedForward
 
@@ -198,6 +199,8 @@ class BasicAVTransformerBlock(nn.Module):
         audio_cross_rope_freqs: mx.array | None = None,
         video_attention_mask: mx.array | None = None,
         audio_attention_mask: mx.array | None = None,
+        perturbations: BatchedPerturbationConfig | None = None,
+        block_idx: int = 0,
     ) -> tuple[mx.array, mx.array]:
         """Forward pass for joint audio+video block.
 
@@ -218,6 +221,11 @@ class BasicAVTransformerBlock(nn.Module):
             audio_rope_freqs: RoPE frequencies for audio.
             video_attention_mask: Attention mask for video self-attention.
             audio_attention_mask: Attention mask for audio self-attention.
+            perturbations: Optional perturbation config for STG guidance.
+                When provided, generates masks that zero out attention outputs
+                for perturbed samples in the batch.
+            block_idx: Index of this block in the transformer stack, used for
+                per-block perturbation lookup.
 
         Returns:
             Tuple of (video_hidden, audio_hidden).
@@ -256,18 +264,27 @@ class BasicAVTransformerBlock(nn.Module):
 
         # --- 1. Video self-attention ---
         video_normed = self._rms_norm(video_hidden) * (1.0 + v_scale_sa) + v_shift_sa
-        video_hidden = (
-            video_hidden
-            + self.attn1(video_normed, rope_freqs=video_rope_freqs, attention_mask=video_attention_mask) * v_gate_sa
-        )
+        video_sa_out = self.attn1(video_normed, rope_freqs=video_rope_freqs, attention_mask=video_attention_mask)
+        # Apply STG perturbation mask: zero out self-attention for perturbed samples
+        if perturbations is not None and perturbations.any_in_batch(PerturbationType.SKIP_VIDEO_SELF_ATTN, block_idx):
+            if perturbations.all_in_batch(PerturbationType.SKIP_VIDEO_SELF_ATTN, block_idx):
+                video_sa_out = mx.zeros_like(video_sa_out)
+            else:
+                v_ptb_mask = perturbations.mask_like(PerturbationType.SKIP_VIDEO_SELF_ATTN, block_idx, video_sa_out)
+                video_sa_out = video_sa_out * v_ptb_mask
+        video_hidden = video_hidden + video_sa_out * v_gate_sa
 
         # --- 2. Audio self-attention ---
         audio_normed = self._rms_norm(audio_hidden) * (1.0 + a_scale_sa) + a_shift_sa
-        audio_hidden = (
-            audio_hidden
-            + self.audio_attn1(audio_normed, rope_freqs=audio_rope_freqs, attention_mask=audio_attention_mask)
-            * a_gate_sa
-        )
+        audio_sa_out = self.audio_attn1(audio_normed, rope_freqs=audio_rope_freqs, attention_mask=audio_attention_mask)
+        # Apply STG perturbation mask for audio self-attention
+        if perturbations is not None and perturbations.any_in_batch(PerturbationType.SKIP_AUDIO_SELF_ATTN, block_idx):
+            if perturbations.all_in_batch(PerturbationType.SKIP_AUDIO_SELF_ATTN, block_idx):
+                audio_sa_out = mx.zeros_like(audio_sa_out)
+            else:
+                a_ptb_mask = perturbations.mask_like(PerturbationType.SKIP_AUDIO_SELF_ATTN, block_idx, audio_sa_out)
+                audio_sa_out = audio_sa_out * a_ptb_mask
+        audio_hidden = audio_hidden + audio_sa_out * a_gate_sa
 
         # --- 3. Video text cross-attention (AdaLN indices 6-8 + prompt table for KV) ---
         if video_text_embeds is not None:
@@ -293,9 +310,8 @@ class BasicAVTransformerBlock(nn.Module):
         # A2V: Q from video, KV from audio
         video_q_a2v = video_norm3 * (1.0 + av_v_scale_a2v) + av_v_shift_a2v
         audio_kv_a2v = audio_norm3 * (1.0 + av_a_scale_a2v) + av_a_shift_a2v
-        video_hidden = (
-            video_hidden
-            + self.audio_to_video_attn(
+        a2v_out = (
+            self.audio_to_video_attn(
                 video_q_a2v,
                 encoder_hidden_states=audio_kv_a2v,
                 rope_freqs=video_cross_rope_freqs,
@@ -303,13 +319,17 @@ class BasicAVTransformerBlock(nn.Module):
             )
             * av_v_gate_a2v
         )
+        # Apply STG perturbation mask for A2V cross-attention
+        if perturbations is not None and perturbations.any_in_batch(PerturbationType.SKIP_A2V_CROSS_ATTN, block_idx):
+            a2v_mask = perturbations.mask_like(PerturbationType.SKIP_A2V_CROSS_ATTN, block_idx, a2v_out)
+            a2v_out = a2v_out * a2v_mask
+        video_hidden = video_hidden + a2v_out
 
         # V2A: Q from audio, KV from video (using pre-A2V norms)
         audio_q_v2a = audio_norm3 * (1.0 + av_a_scale_v2a) + av_a_shift_v2a
         video_kv_v2a = video_norm3 * (1.0 + av_v_scale_v2a) + av_v_shift_v2a
-        audio_hidden = (
-            audio_hidden
-            + self.video_to_audio_attn(
+        v2a_out = (
+            self.video_to_audio_attn(
                 audio_q_v2a,
                 encoder_hidden_states=video_kv_v2a,
                 rope_freqs=audio_cross_rope_freqs,
@@ -317,6 +337,11 @@ class BasicAVTransformerBlock(nn.Module):
             )
             * av_a_gate_v2a
         )
+        # Apply STG perturbation mask for V2A cross-attention
+        if perturbations is not None and perturbations.any_in_batch(PerturbationType.SKIP_V2A_CROSS_ATTN, block_idx):
+            v2a_mask = perturbations.mask_like(PerturbationType.SKIP_V2A_CROSS_ATTN, block_idx, v2a_out)
+            v2a_out = v2a_out * v2a_mask
+        audio_hidden = audio_hidden + v2a_out
 
         # --- 7. Video feed-forward (uses indices 3-5) ---
         video_normed = self._rms_norm(video_hidden) * (1.0 + v_scale_ff) + v_shift_ff

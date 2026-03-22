@@ -24,7 +24,9 @@ via :func:`~ltx_2_mlx.model.video_vae.ops.remap_encoder_weight_keys`.
 
 from __future__ import annotations
 
+import logging
 import subprocess
+from collections.abc import Iterator
 from typing import Any
 
 import mlx.core as mx
@@ -40,8 +42,51 @@ from ltx_core_mlx.model.video_vae.sampling import (
     patchify_spatial,
     pixel_shuffle_3d,
 )
+from ltx_core_mlx.model.video_vae.tiling import (
+    Tile,
+    TilingConfig,
+    prepare_tiles_for_decoding,
+    prepare_tiles_for_encoding,
+)
 from ltx_core_mlx.utils.ffmpeg import find_ffmpeg
 from ltx_core_mlx.utils.memory import aggressive_cleanup
+
+logger: logging.Logger = logging.getLogger(__name__)
+
+
+def _add_at(buffer: mx.array, coords: tuple[slice, ...], values: mx.array) -> mx.array:
+    """Add values into buffer at the given slice coordinates.
+
+    MLX arrays are immutable, so we use slice assignment via __setitem__
+    on a copy. In practice MLX handles this efficiently.
+    """
+    # MLX supports in-place-style slice assignment that returns a new array
+    buffer[coords] = buffer[coords] + values
+    return buffer
+
+
+def _group_tiles_by_temporal_slice(tiles: list[Tile]) -> list[list[Tile]]:
+    """Group tiles by their temporal output slice."""
+    if not tiles:
+        return []
+
+    groups: list[list[Tile]] = []
+    current_slice = tiles[0].out_coords[2]
+    current_group: list[Tile] = []
+
+    for tile in tiles:
+        tile_slice = tile.out_coords[2]
+        if tile_slice == current_slice:
+            current_group.append(tile)
+        else:
+            groups.append(current_group)
+            current_slice = tile_slice
+            current_group = [tile]
+
+    if current_group:
+        groups.append(current_group)
+
+    return groups
 
 
 class VideoDecoder(nn.Module):
@@ -171,6 +216,117 @@ class VideoDecoder(nn.Module):
 
         # BFHWC -> BCFHW
         return x.transpose(0, 4, 1, 2, 3)
+
+    def tiled_decode(
+        self,
+        latent: mx.array,
+        tiling_config: TilingConfig | None = None,
+    ) -> Iterator[mx.array]:
+        """Decode a latent tensor into video frames using tiled processing.
+
+        Splits the latent into tiles, decodes each independently, and yields
+        video chunks by temporal slice. Overlapping regions are blended using
+        trapezoidal masks.
+
+        Args:
+            latent: (B, C, F', H', W') latent in PyTorch layout.
+            tiling_config: Tiling configuration. If None, decodes without tiling.
+
+        Yields:
+            Video chunks (B, 3, T, H, W) in [-1, 1], by temporal slices.
+        """
+        if tiling_config is None:
+            yield self.decode(latent)
+            return
+
+        tiles = prepare_tiles_for_decoding(latent.shape, tiling_config)
+
+        # Group tiles by temporal output slice
+        temporal_groups = _group_tiles_by_temporal_slice(tiles)
+
+        # Calculate full output spatial dims from latent shape
+        _, _, F_lat, H_lat, W_lat = latent.shape
+        out_H = H_lat * 32
+        out_W = W_lat * 32
+
+        # State for temporal overlap blending
+        previous_chunk: mx.array | None = None
+        previous_weights: mx.array | None = None
+        previous_temporal_slice: slice | None = None
+
+        for temporal_group_tiles in temporal_groups:
+            curr_temporal_slice = temporal_group_tiles[0].out_coords[2]
+            temporal_len = curr_temporal_slice.stop - curr_temporal_slice.start
+
+            # Initialize accumulation buffers for this temporal group
+            buffer = mx.zeros((latent.shape[0], 3, temporal_len, out_H, out_W))
+            weights = mx.zeros_like(buffer)
+
+            for tile in temporal_group_tiles:
+                # Decode tile
+                decoded_tile = self.decode(latent[tile.in_coords])
+                mask = tile.blend_mask
+
+                temporal_offset = tile.out_coords[2].start - curr_temporal_slice.start
+                expected_temporal_len = tile.out_coords[2].stop - tile.out_coords[2].start
+                decoded_temporal_len = decoded_tile.shape[2]
+                actual_temporal_len = min(
+                    expected_temporal_len, decoded_temporal_len, buffer.shape[2] - temporal_offset
+                )
+
+                chunk_coords = (
+                    slice(None),  # batch
+                    slice(None),  # channels
+                    slice(temporal_offset, temporal_offset + actual_temporal_len),
+                    tile.out_coords[3],  # height
+                    tile.out_coords[4],  # width
+                )
+
+                decoded_slice = decoded_tile[:, :, :actual_temporal_len, :, :]
+                mask_slice = mask[:, :, :actual_temporal_len, :, :] if mask.shape[2] > 1 else mask
+
+                buffer = _add_at(buffer, chunk_coords, decoded_slice * mask_slice)
+                weights = _add_at(weights, chunk_coords, mask_slice)
+
+                del decoded_tile, mask, decoded_slice, mask_slice
+                aggressive_cleanup()
+
+            # Blend with previous temporal chunk if overlap exists
+            if previous_chunk is not None and previous_temporal_slice is not None:
+                if previous_temporal_slice.stop > curr_temporal_slice.start:
+                    overlap_len = previous_temporal_slice.stop - curr_temporal_slice.start
+                    prev_overlap_start = curr_temporal_slice.start - previous_temporal_slice.start
+
+                    # Add current overlap into previous buffers
+                    prev_overlap = previous_chunk[:, :, prev_overlap_start:, :, :]
+                    prev_w_overlap = previous_weights[:, :, prev_overlap_start:, :, :]
+                    curr_overlap = buffer[:, :, :overlap_len, :, :]
+                    curr_w_overlap = weights[:, :, :overlap_len, :, :]
+
+                    merged = prev_overlap + curr_overlap
+                    merged_w = prev_w_overlap + curr_w_overlap
+
+                    # Write merged back into both buffers
+                    previous_chunk = mx.concatenate([previous_chunk[:, :, :prev_overlap_start, :, :], merged], axis=2)
+                    previous_weights = mx.concatenate(
+                        [previous_weights[:, :, :prev_overlap_start, :, :], merged_w], axis=2
+                    )
+                    buffer = mx.concatenate([merged, buffer[:, :, overlap_len:, :, :]], axis=2)
+                    weights = mx.concatenate([merged_w, weights[:, :, overlap_len:, :, :]], axis=2)
+
+                # Yield the non-overlapping part of the previous chunk
+                safe_weights = mx.maximum(previous_weights, 1e-8)
+                yield_len = curr_temporal_slice.start - previous_temporal_slice.start
+                yield (previous_chunk / safe_weights)[:, :, :yield_len, :, :]
+
+            previous_chunk = buffer
+            previous_weights = weights
+            previous_temporal_slice = curr_temporal_slice
+
+        # Yield remaining chunk
+        if previous_chunk is not None and previous_weights is not None:
+            safe_weights = mx.maximum(previous_weights, 1e-8)
+            yield previous_chunk / safe_weights
 
     def decode_and_stream(
         self,
@@ -339,3 +495,61 @@ class VideoEncoder(nn.Module):
 
         # BFHWC -> BCFHW
         return x.transpose(0, 4, 1, 2, 3)
+
+    def tiled_encode(
+        self,
+        video: mx.array,
+        tiling_config: TilingConfig | None = None,
+    ) -> mx.array:
+        """Encode video to latent using tiled processing.
+
+        Splits the video into overlapping tiles, encodes each independently,
+        and blends overlapping regions using rectangular masks.
+
+        Args:
+            video: (B, 3, F, H, W) in [-1, 1], PyTorch layout.
+            tiling_config: Tiling configuration. If None, encodes without tiling.
+
+        Returns:
+            Latent (B, 128, F', H', W') in PyTorch layout.
+        """
+        if tiling_config is None:
+            return self.encode(video)
+
+        batch, _, frames, height, width = video.shape
+
+        # Crop frames to valid count (1 + 8*k)
+        if (frames - 1) % 8 != 0:
+            frames_to_crop = (frames - 1) % 8
+            logger.warning(
+                "Invalid frame count %d for encode; cropping last %d frames.",
+                frames,
+                frames_to_crop,
+            )
+            video = video[:, :, :-frames_to_crop, :, :]
+            frames = video.shape[2]
+
+        # Calculate output latent shape
+        latent_F = (frames - 1) // 8 + 1
+        latent_H = height // 32
+        latent_W = width // 32
+
+        tiles = prepare_tiles_for_encoding(video.shape, tiling_config)
+
+        # Accumulation buffers
+        latent_buffer = mx.zeros((batch, 128, latent_F, latent_H, latent_W))
+        weights_buffer = mx.zeros_like(latent_buffer)
+
+        for tile in tiles:
+            video_tile = video[tile.in_coords]
+            latent_tile = self.encode(video_tile)
+            mask = tile.blend_mask
+
+            latent_buffer = _add_at(latent_buffer, tile.out_coords, latent_tile * mask)
+            weights_buffer = _add_at(weights_buffer, tile.out_coords, mask)
+
+            del latent_tile, mask, video_tile
+            aggressive_cleanup()
+
+        safe_weights = mx.maximum(weights_buffer, 1e-8)
+        return latent_buffer / safe_weights
