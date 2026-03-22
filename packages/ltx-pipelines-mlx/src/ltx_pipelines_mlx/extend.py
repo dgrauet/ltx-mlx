@@ -5,13 +5,21 @@ Ported from ltx-pipelines extend functionality.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import mlx.core as mx
 
 from ltx_core_mlx.conditioning.types.latent_cond import LatentState, create_initial_state
+from ltx_core_mlx.model.audio_vae import AudioProcessor, AudioVAEEncoder, encode_audio
 from ltx_core_mlx.model.transformer.model import X0Model
 from ltx_core_mlx.model.video_vae.patchifier import compute_video_latent_shape
+from ltx_core_mlx.model.video_vae.video_vae import VideoEncoder
+from ltx_core_mlx.utils.audio import load_audio
+from ltx_core_mlx.utils.ffmpeg import probe_video_info
+from ltx_core_mlx.utils.image import load_video_frames
 from ltx_core_mlx.utils.memory import aggressive_cleanup
-from ltx_core_mlx.utils.positions import compute_audio_positions, compute_video_positions
+from ltx_core_mlx.utils.positions import compute_audio_positions, compute_audio_token_count, compute_video_positions
+from ltx_core_mlx.utils.weights import load_split_safetensors, remap_audio_vae_keys
 from ltx_pipelines_mlx.denoise import denoise_loop
 from ltx_pipelines_mlx.scheduler import DISTILLED_SIGMAS
 from ltx_pipelines_mlx.ti2vid_one_stage import TextToVideoPipeline
@@ -24,6 +32,113 @@ class ExtendPipeline(TextToVideoPipeline):
         model_dir: Path to model weights.
         low_memory: Aggressive memory management.
     """
+
+    def __init__(self, model_dir: str, low_memory: bool = True):
+        super().__init__(model_dir, low_memory)
+        self.vae_encoder: VideoEncoder | None = None
+        self.audio_encoder: AudioVAEEncoder | None = None
+        self.audio_processor: AudioProcessor | None = None
+
+    def _load_encoders(self) -> None:
+        """Load VAE encoder and audio encoder for video-from-file workflows."""
+        if self.vae_encoder is None:
+            self.vae_encoder = VideoEncoder()
+            enc_weights = load_split_safetensors(self.model_dir / "vae_encoder.safetensors", prefix="vae_encoder.")
+            self.vae_encoder.load_weights(list(enc_weights.items()))
+            aggressive_cleanup()
+
+        if self.audio_encoder is None:
+            self.audio_encoder = AudioVAEEncoder()
+            encoder_weights = load_split_safetensors(
+                self.model_dir / "audio_vae.safetensors", prefix="audio_vae.encoder."
+            )
+            encoder_weights = remap_audio_vae_keys(encoder_weights)
+            self.audio_encoder.load_weights(list(encoder_weights.items()))
+            self.audio_processor = AudioProcessor()
+            aggressive_cleanup()
+
+    def extend_from_video(
+        self,
+        prompt: str,
+        video_path: str | Path,
+        extend_frames: int,
+        direction: str = "after",
+        seed: int = 42,
+        num_steps: int | None = None,
+    ) -> tuple[mx.array, mx.array]:
+        """Extend a video file by adding frames.
+
+        Convenience wrapper that loads the video, encodes it to latents,
+        and calls :meth:`extend`.
+
+        Args:
+            prompt: Text prompt for new frames.
+            video_path: Path to the source video file.
+            extend_frames: Number of latent frames to add.
+            direction: "before" or "after".
+            seed: Random seed.
+            num_steps: Number of denoising steps.
+
+        Returns:
+            Tuple of (extended_video_latent, extended_audio_latent).
+        """
+        self.load()
+        self._load_encoders()
+        assert self.vae_encoder is not None
+
+        video_path = str(video_path)
+        info = probe_video_info(video_path)
+
+        # Load video frames via ffmpeg -> (B, 3, F, H, W)
+        video_tensor = load_video_frames(video_path, info.height, info.width, info.num_frames)
+        video_latent = self.vae_encoder.encode(video_tensor)
+        if self.low_memory:
+            del video_tensor
+            aggressive_cleanup()
+
+        # Encode audio if present
+        audio_latent: mx.array | None = None
+        if info.has_audio:
+            assert self.audio_encoder is not None
+            assert self.audio_processor is not None
+            audio_data = load_audio(
+                video_path,
+                target_sample_rate=16000,
+                max_duration=info.num_frames / info.fps,
+            )
+            if audio_data is not None:
+                audio_latent = encode_audio(
+                    audio_data.waveform,
+                    audio_data.sample_rate,
+                    self.audio_encoder,
+                    self.audio_processor,
+                )
+                if self.low_memory:
+                    aggressive_cleanup()
+
+        if audio_latent is None:
+            # Create silence audio latent
+            audio_T = compute_audio_token_count(info.num_frames)
+            audio_latent = mx.zeros((1, 8, audio_T, 16), dtype=mx.bfloat16)
+
+        # Free encoders to save memory
+        if self.low_memory:
+            self.vae_encoder = None
+            self.audio_encoder = None
+            self.audio_processor = None
+            aggressive_cleanup()
+
+        return self.extend(
+            prompt=prompt,
+            source_video_latent=video_latent,
+            source_audio_latent=audio_latent,
+            extend_frames=extend_frames,
+            direction=direction,
+            height=info.height,
+            width=info.width,
+            seed=seed,
+            num_steps=num_steps,
+        )
 
     def extend(
         self,

@@ -8,6 +8,8 @@ fewer steps, and distilled schedule for stage 2 refinement.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import mlx.core as mx
 from PIL import Image
 
@@ -203,3 +205,76 @@ class TwoStageHQPipeline(TextToVideoPipeline):
         audio_latent = self.audio_patchifier.unpatchify(output_2.audio_latent)
 
         return video_latent, audio_latent
+
+    def generate_and_save(
+        self,
+        prompt: str,
+        output_path: str,
+        image: Image.Image | str | None = None,
+        height: int = 480,
+        width: int = 704,
+        num_frames: int = 97,
+        seed: int = 42,
+        stage1_steps: int = 20,
+        stage2_steps: int | None = None,
+    ) -> str:
+        """Generate HQ two-stage video+audio and save to file.
+
+        Args:
+            prompt: Text prompt.
+            output_path: Path to output video file.
+            image: Optional reference image for I2V conditioning.
+            height: Final video height.
+            width: Final video width.
+            num_frames: Number of frames.
+            seed: Random seed.
+            stage1_steps: Steps for stage 1 (res_2s sampler, default 20).
+            stage2_steps: Steps for stage 2 refinement.
+
+        Returns:
+            Path to the output video file.
+        """
+        video_latent, audio_latent = self.generate_hq(
+            prompt=prompt,
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            seed=seed,
+            stage1_steps=stage1_steps,
+            stage2_steps=stage2_steps,
+            image=image,
+        )
+
+        # Free transformer + text encoder to make room for VAE decode
+        if self.low_memory:
+            self.dit = None
+            self.text_encoder = None
+            self.feature_extractor = None
+            self.vae_encoder = None
+            self.upsampler = None
+            self._loaded = False
+            aggressive_cleanup()
+
+        # Decode audio first (smaller)
+        assert self.audio_decoder is not None
+        assert self.vocoder is not None
+        mel = self.audio_decoder.decode(audio_latent)
+        waveform = self.vocoder(mel)
+        if self.low_memory:
+            aggressive_cleanup()
+
+        # Save audio to temp file
+        import tempfile
+
+        audio_path = tempfile.mktemp(suffix=".wav")
+        self._save_waveform(waveform, audio_path, sample_rate=48000)
+
+        # Decode video and stream to ffmpeg
+        assert self.vae_decoder is not None
+        self.vae_decoder.decode_and_stream(video_latent, output_path, fps=24.0, audio_path=audio_path)
+
+        # Cleanup temp audio
+        Path(audio_path).unlink(missing_ok=True)
+        aggressive_cleanup()
+
+        return output_path
