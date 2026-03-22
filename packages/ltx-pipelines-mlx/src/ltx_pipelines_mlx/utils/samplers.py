@@ -209,6 +209,35 @@ def _res2s_sde_coeff(
     return alpha_ratio, sigma_down, sigma_up
 
 
+def _sde_step(
+    sample: mx.array,
+    denoised: mx.array,
+    sigma: float,
+    sigma_next: float,
+    noise: mx.array,
+) -> mx.array:
+    """Apply Res2s SDE noise injection step.
+
+    Ported from Res2sDiffusionStep.step() in ltx-core.
+    """
+    if sigma_next == 0:
+        return denoised.astype(mx.bfloat16)
+
+    sigma_up = min(sigma_next * 0.5, sigma_next * 0.9999)
+    sigma_signal = 1.0 - sigma_next
+    sigma_residual = max(0.0, sigma_next**2 - sigma_up**2) ** 0.5
+    alpha_ratio = sigma_signal + sigma_residual
+    sigma_down = sigma_residual / alpha_ratio if alpha_ratio > 0 else sigma_next
+
+    if sigma_up == 0:
+        return denoised.astype(mx.bfloat16)
+
+    eps_next = (sample - denoised) / (sigma - sigma_next) if sigma != sigma_next else mx.zeros_like(sample)
+    denoised_next = sample - sigma * eps_next
+    x_noised = alpha_ratio * (denoised_next + sigma_down * eps_next) + sigma_up * noise
+    return x_noised.astype(mx.bfloat16)
+
+
 def res2s_denoise_loop(
     model: X0Model,
     video_state: LatentState,
@@ -221,11 +250,24 @@ def res2s_denoise_loop(
     video_attention_mask: mx.array | None = None,
     audio_attention_mask: mx.array | None = None,
     show_progress: bool = True,
+    bongmath: bool = True,
+    bongmath_max_iter: int = 100,
 ) -> DenoiseOutput:
     """Run the res_2s second-order denoising loop for joint audio+video.
 
-    Uses a second-order Runge-Kutta method with SDE noise injection for
-    higher quality at fewer steps.
+    Ported from ltx-pipelines res2s_audio_video_denoising_loop. Uses a
+    second-order exponential integrator with SDE noise injection at both
+    substep and step levels, plus optional iterative anchor refinement.
+
+    The algorithm:
+    1. Evaluate model at current sigma → x0 prediction
+    2. Compute epsilon = x0 - x_anchor (denoised direction)
+    3. Compute substep x_mid = x_anchor + h * a21 * epsilon
+    4. Inject SDE noise at substep (sigma → sub_sigma)
+    5. Optionally refine anchor via bong iteration
+    6. Evaluate model at sub_sigma → second x0 prediction
+    7. Combine: x_next = x_anchor + h * (b1 * eps1 + b2 * eps2)
+    8. Inject SDE noise at step level (sigma → sigma_next)
 
     Args:
         model: X0Model wrapping the LTXModel.
@@ -239,6 +281,8 @@ def res2s_denoise_loop(
         video_attention_mask: Attention mask for video.
         audio_attention_mask: Attention mask for audio.
         show_progress: Whether to show tqdm progress bar.
+        bongmath: Enable iterative anchor refinement for small steps.
+        bongmath_max_iter: Max iterations for bong refinement.
 
     Returns:
         DenoiseOutput with final video and audio latents.
@@ -246,7 +290,9 @@ def res2s_denoise_loop(
     import math
 
     if sigmas is None:
-        sigmas = DISTILLED_SIGMAS
+        sigmas = list(DISTILLED_SIGMAS)
+    else:
+        sigmas = list(sigmas)
 
     # Resolve positions and attention masks from state
     if video_positions is None and video_state.positions is not None:
@@ -258,26 +304,31 @@ def res2s_denoise_loop(
     if audio_attention_mask is None and audio_state.attention_mask is not None:
         audio_attention_mask = audio_state.attention_mask
 
-    video_x = video_state.latent
-    audio_x = audio_state.latent
+    video_x = video_state.latent.astype(mx.float32)
+    audio_x = audio_state.latent.astype(mx.float32)
 
     video_uniform = _is_uniform_mask(video_state.denoise_mask)
     audio_uniform = _is_uniform_mask(audio_state.denoise_mask)
 
-    steps = list(zip(sigmas[:-1], sigmas[1:]))
-    iterator = tqdm(steps, desc="Denoising (res2s)", disable=not show_progress)
+    n_full_steps = len(sigmas) - 1
 
-    def _predict(
-        v_x: mx.array,
-        a_x: mx.array,
-        sig: float,
-    ) -> tuple[mx.array, mx.array]:
-        """Run model prediction at a given sigma."""
+    # Inject minimal sigma to avoid division by zero (matching reference)
+    if sigmas[-1] == 0:
+        sigmas = sigmas[:-1] + [0.0011, 0.0]
+
+    # Step sizes in log-space: h_i = -log(sigma_{i+1} / sigma_i)
+    hs = [-math.log(sigmas[i + 1] / sigmas[i]) for i in range(len(sigmas) - 1)]
+
+    phi_cache: dict = {}
+    c2 = 0.5
+
+    def _predict(v_x: mx.array, a_x: mx.array, sig: float) -> tuple[mx.array, mx.array]:
+        """Run model prediction and apply denoise mask."""
         sig_arr = mx.array([sig], dtype=mx.bfloat16)
         B = v_x.shape[0]
         kw: dict = dict(
-            video_latent=v_x,
-            audio_latent=a_x,
+            video_latent=v_x.astype(mx.bfloat16),
+            audio_latent=a_x.astype(mx.bfloat16),
             sigma=mx.broadcast_to(sig_arr, (B,)),
             video_text_embeds=video_text_embeds,
             audio_text_embeds=audio_text_embeds,
@@ -294,55 +345,80 @@ def res2s_denoise_loop(
         v_x0, a_x0 = model(**kw)
         v_x0 = apply_denoise_mask(v_x0, video_state.clean_latent, video_state.denoise_mask)
         a_x0 = apply_denoise_mask(a_x0, audio_state.clean_latent, audio_state.denoise_mask)
-        return v_x0, a_x0
+        return v_x0.astype(mx.float32), a_x0.astype(mx.float32)
 
-    for step_idx, (sigma, sigma_next) in enumerate(iterator):
-        # First evaluation
-        video_x0, audio_x0 = _predict(video_x, audio_x, sigma)
+    iterator = tqdm(range(n_full_steps), desc="Denoising (res2s)", disable=not show_progress)
 
-        if sigma_next == 0.0:
-            video_x = video_x0
-            audio_x = audio_x0
-        else:
-            h = math.log(sigma / sigma_next) if sigma_next > 0 else 0.0
-            a21, b1, b2 = _res2s_coefficients(h)
-            alpha_ratio, sigma_down, sigma_up = _res2s_sde_coeff(sigma_next)
+    for step_idx in iterator:
+        sigma = sigmas[step_idx]
+        sigma_next = sigmas[step_idx + 1]
+        h = hs[step_idx]
 
-            # Epsilon prediction
-            video_eps = (video_x - video_x0) / sigma if sigma > 0 else mx.zeros_like(video_x)
-            audio_eps = (audio_x - audio_x0) / sigma if sigma > 0 else mx.zeros_like(audio_x)
+        x_anchor_v = video_x
+        x_anchor_a = audio_x
 
-            # Midpoint
-            sigma_mid = sigma * (1.0 - a21) + sigma_next * a21
-            video_mid = video_x0 + sigma_mid * video_eps
-            audio_mid = audio_x0 + sigma_mid * audio_eps
+        # Stage 1: evaluate at current point
+        denoised_v1, denoised_a1 = _predict(video_x, audio_x, sigma)
 
-            # Second evaluation at midpoint
-            video_x0_mid, audio_x0_mid = _predict(video_mid, audio_mid, sigma_mid)
+        a21, b1, b2 = get_res2s_coefficients(h, phi_cache, c2)
 
-            video_eps_mid = (video_mid - video_x0_mid) / sigma_mid if sigma_mid > 0 else mx.zeros_like(video_mid)
-            audio_eps_mid = (audio_mid - audio_x0_mid) / sigma_mid if sigma_mid > 0 else mx.zeros_like(audio_mid)
+        # Substep sigma: geometric mean (exact for c2=0.5)
+        sub_sigma = math.sqrt(sigma * sigma_next)
 
-            # Combine first and second order estimates
-            video_denoised = video_x0 + sigma_down * (b1 * video_eps + b2 * video_eps_mid)
-            audio_denoised = audio_x0 + sigma_down * (b1 * audio_eps + b2 * audio_eps_mid)
+        # Epsilon = x0 - x_anchor (denoised direction, NOT velocity)
+        eps_1_v = denoised_v1 - x_anchor_v
+        eps_1_a = denoised_a1 - x_anchor_a
 
-            # SDE noise injection
-            if sigma_up > 0:
-                mx.random.seed(step_idx * 1000 + 42)
-                video_noise = mx.random.normal(video_x.shape).astype(mx.bfloat16)
-                audio_noise = mx.random.normal(audio_x.shape).astype(mx.bfloat16)
-                video_x = alpha_ratio * video_denoised + sigma_up * video_noise
-                audio_x = alpha_ratio * audio_denoised + sigma_up * audio_noise
-            else:
-                video_x = video_denoised
-                audio_x = audio_denoised
+        # Substep x
+        x_mid_v = x_anchor_v + h * a21 * eps_1_v
+        x_mid_a = x_anchor_a + h * a21 * eps_1_a
 
-        # Force computation for memory efficiency
-        mx.eval(video_x, audio_x)
+        # SDE noise at substep
+        mx.random.seed(step_idx * 10000 + 1)
+        sub_noise_v = mx.random.normal(video_x.shape).astype(mx.float32)
+        sub_noise_a = mx.random.normal(audio_x.shape).astype(mx.float32)
+        x_mid_v = _sde_step(x_anchor_v, x_mid_v, sigma, sub_sigma, sub_noise_v).astype(mx.float32)
+        x_mid_a = _sde_step(x_anchor_a, x_mid_a, sigma, sub_sigma, sub_noise_a).astype(mx.float32)
+
+        # Bong iteration: refine anchor for stability at small step sizes
+        if bongmath and h < 0.5 and sigma > 0.03:
+            for _ in range(bongmath_max_iter):
+                x_anchor_v = x_mid_v - h * a21 * eps_1_v
+                eps_1_v = denoised_v1 - x_anchor_v
+                x_anchor_a = x_mid_a - h * a21 * eps_1_a
+                eps_1_a = denoised_a1 - x_anchor_a
+
+        # Stage 2: evaluate at substep
+        denoised_v2, denoised_a2 = _predict(x_mid_v, x_mid_a, sub_sigma)
+
+        eps_2_v = denoised_v2 - x_anchor_v
+        eps_2_a = denoised_a2 - x_anchor_a
+
+        # Final combination
+        x_next_v = x_anchor_v + h * (b1 * eps_1_v + b2 * eps_2_v)
+        x_next_a = x_anchor_a + h * (b1 * eps_1_a + b2 * eps_2_a)
+
+        # SDE noise at step level
+        mx.random.seed(step_idx * 10000 + 2)
+        step_noise_v = mx.random.normal(video_x.shape).astype(mx.float32)
+        step_noise_a = mx.random.normal(audio_x.shape).astype(mx.float32)
+        video_x = _sde_step(x_anchor_v, x_next_v, sigma, sigma_next, step_noise_v).astype(mx.float32)
+        audio_x = _sde_step(x_anchor_a, x_next_a, sigma, sigma_next, step_noise_a).astype(mx.float32)
+
+        mx.async_eval(video_x, audio_x)
+
+    # Final cleanup: if original schedule ended at 0, do one last denoise
+    if sigmas[-1] == 0:
+        video_x0, audio_x0 = _predict(video_x, audio_x, sigmas[n_full_steps])
+        video_x = video_x0
+        audio_x = audio_x0
+        mx.async_eval(video_x, audio_x)
 
     aggressive_cleanup()
-    return DenoiseOutput(video_latent=video_x, audio_latent=audio_x)
+    return DenoiseOutput(
+        video_latent=video_x.astype(mx.bfloat16),
+        audio_latent=audio_x.astype(mx.bfloat16),
+    )
 
 
 # --- Guided denoising with CFG/STG/modality guidance ---

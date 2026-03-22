@@ -196,17 +196,19 @@ def _fuse_delta_with_quantized(
     new_weight = original + deltas.astype(mx.float32)
 
     # Re-quantize with same parameters
-    # Determine bits from weight dtype/shape
-    group_size = scales.shape[-1] if scales is not None and scales.ndim > 1 else 64
-    # Infer bits from packing ratio
-    in_features_packed = weight.shape[-1]
+    # Infer group_size from scales shape: scales is (O, num_groups, 1),
+    # so group_size = in_features / num_groups
     in_features_real = new_weight.shape[-1]
+    if scales is not None and scales.ndim > 1:
+        num_groups = scales.shape[1]
+        group_size = max(1, in_features_real // num_groups) if num_groups > 0 else 64
+    else:
+        group_size = 64
+    # Infer bits from packing ratio between quantized and dequantized
+    in_features_packed = weight.shape[-1]
     if in_features_packed > 0 and in_features_real > 0:
         pack_ratio = in_features_real / in_features_packed
-        if pack_ratio > 6:
-            bits = 4
-        else:
-            bits = 8
+        bits = 4 if pack_ratio > 6 else 8
     else:
         bits = 8
 
