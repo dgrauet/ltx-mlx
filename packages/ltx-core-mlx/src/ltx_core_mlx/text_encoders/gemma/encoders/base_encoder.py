@@ -1,6 +1,6 @@
 """Gemma 3 language model wrapper via mlx-lm.
 
-Ported from ltx-core/src/ltx_core/text_encoders/gemma/language_model.py
+Ported from ltx-core/src/ltx_core/text_encoders/gemma/encoders/base_encoder.py
 """
 
 from __future__ import annotations

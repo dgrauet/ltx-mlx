@@ -7,10 +7,10 @@ from __future__ import annotations
 
 import mlx.core as mx
 
+from ltx_core_mlx.components.patchifiers import compute_video_latent_shape
 from ltx_core_mlx.conditioning.types.keyframe_cond import VideoConditionByKeyframeIndex
 from ltx_core_mlx.conditioning.types.latent_cond import create_initial_state
 from ltx_core_mlx.model.transformer.model import X0Model
-from ltx_core_mlx.model.video_vae.patchifier import compute_video_latent_shape
 from ltx_core_mlx.utils.memory import aggressive_cleanup
 from ltx_core_mlx.utils.positions import compute_audio_positions, compute_audio_token_count, compute_video_positions
 from ltx_pipelines_mlx.scheduler import DISTILLED_SIGMAS

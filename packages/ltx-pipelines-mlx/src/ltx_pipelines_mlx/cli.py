@@ -92,7 +92,7 @@ def _cmd_generate(args: argparse.Namespace) -> None:
     # Enhance prompt if requested
     prompt = args.prompt
     if args.enhance_prompt:
-        from ltx_core_mlx.text_encoders.gemma.language_model import GemmaLanguageModel
+        from ltx_core_mlx.text_encoders.gemma.encoders.base_encoder import GemmaLanguageModel
 
         if not args.quiet:
             print("Enhancing prompt...")
@@ -147,7 +147,7 @@ def _cmd_generate(args: argparse.Namespace) -> None:
         _decode_and_save(pipe, video_latent, audio_latent, args)
 
     elif args.image:
-        from ltx_pipelines_mlx.i2vid_one_stage import ImageToVideoPipeline
+        from ltx_pipelines_mlx.ti2vid_one_stage import ImageToVideoPipeline
 
         if not args.quiet:
             print("Mode: Image-to-Video")
@@ -233,7 +233,7 @@ def _print_result(output: str, t0: float, quiet: bool) -> None:
 
 def _cmd_enhance(args: argparse.Namespace) -> None:
     """Enhance a prompt using Gemma."""
-    from ltx_core_mlx.text_encoders.gemma.language_model import GemmaLanguageModel
+    from ltx_core_mlx.text_encoders.gemma.encoders.base_encoder import GemmaLanguageModel
 
     print("Loading Gemma...")
     gemma = GemmaLanguageModel()

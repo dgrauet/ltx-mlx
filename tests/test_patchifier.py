@@ -2,7 +2,7 @@
 
 import mlx.core as mx
 
-from ltx_core_mlx.model.video_vae.patchifier import (
+from ltx_core_mlx.components.patchifiers import (
     AudioPatchifier,
     VideoLatentPatchifier,
     compute_video_latent_shape,

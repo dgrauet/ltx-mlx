@@ -38,8 +38,8 @@ class TestRealPromptGeneration:
         from ltx_core_mlx.model.audio_vae.bwe import VocoderWithBWE
         from ltx_core_mlx.model.transformer.model import LTXModel, LTXModelConfig, X0Model
         from ltx_core_mlx.model.video_vae.video_vae import VideoDecoder
+        from ltx_core_mlx.text_encoders.gemma.encoders.base_encoder import GemmaLanguageModel
         from ltx_core_mlx.text_encoders.gemma.feature_extractor import GemmaFeaturesExtractorV2
-        from ltx_core_mlx.text_encoders.gemma.language_model import GemmaLanguageModel
         from ltx_core_mlx.utils.positions import compute_audio_positions, compute_video_positions
         from ltx_core_mlx.utils.weights import apply_quantization, load_split_safetensors, remap_audio_vae_keys
         from ltx_pipelines_mlx.scheduler import DISTILLED_SIGMAS

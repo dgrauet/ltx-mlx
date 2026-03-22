@@ -19,7 +19,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ltx_core_mlx.text_encoders.gemma.embeddings_connector import Embeddings1DConnector
-from ltx_core_mlx.text_encoders.gemma.language_model import GemmaLanguageModel
+from ltx_core_mlx.text_encoders.gemma.encoders.base_encoder import GemmaLanguageModel
 
 
 class TextEmbeddingProjection(nn.Module):

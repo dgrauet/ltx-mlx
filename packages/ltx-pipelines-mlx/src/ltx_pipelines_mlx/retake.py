@@ -9,10 +9,10 @@ from pathlib import Path
 
 import mlx.core as mx
 
+from ltx_core_mlx.components.patchifiers import compute_video_latent_shape
 from ltx_core_mlx.conditioning.types.latent_cond import LatentState, TemporalRegionMask, noise_latent_state
 from ltx_core_mlx.model.audio_vae import AudioProcessor, AudioVAEEncoder, encode_audio
 from ltx_core_mlx.model.transformer.model import X0Model
-from ltx_core_mlx.model.video_vae.patchifier import compute_video_latent_shape
 from ltx_core_mlx.model.video_vae.video_vae import VideoEncoder
 from ltx_core_mlx.utils.audio import load_audio
 from ltx_core_mlx.utils.ffmpeg import probe_video_info

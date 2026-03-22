@@ -11,6 +11,7 @@ from __future__ import annotations
 import mlx.core as mx
 from PIL import Image
 
+from ltx_core_mlx.components.patchifiers import compute_video_latent_shape
 from ltx_core_mlx.conditioning.types.attention_strength_wrapper import (
     ConditioningItemAttentionStrengthWrapper,
 )
@@ -24,7 +25,6 @@ from ltx_core_mlx.conditioning.types.latent_cond import (
 from ltx_core_mlx.conditioning.types.reference_video_cond import VideoConditionByReferenceLatent
 from ltx_core_mlx.model.transformer.model import X0Model
 from ltx_core_mlx.model.upsampler import LatentUpsampler
-from ltx_core_mlx.model.video_vae.patchifier import compute_video_latent_shape
 from ltx_core_mlx.model.video_vae.video_vae import VideoEncoder
 from ltx_core_mlx.utils.image import prepare_image_for_encoding
 from ltx_core_mlx.utils.memory import aggressive_cleanup
