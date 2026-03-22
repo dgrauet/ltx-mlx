@@ -23,6 +23,7 @@ def pixel_shuffle_3d(
     """Rearrange channels into spatial/temporal dimensions (depth-to-space).
 
     Matches: ``"b (c p1 p2 p3) d h w -> b c (d p1) (h p2) (w p3)"``
+    Channel split order: (c, p1=temporal, p2=height, p3=width) — c outermost.
     In BDHWC layout: C_total = C * tf * sf * sf where C varies slowest.
 
     Input:  (B, D, H, W, C * sf^2 * tf)
@@ -33,6 +34,36 @@ def pixel_shuffle_3d(
     x = x.reshape(B, D, H, W, C, temporal_factor, spatial_factor, spatial_factor)
     x = x.transpose(0, 1, 5, 2, 6, 3, 7, 4)
     x = x.reshape(B, D * temporal_factor, H * spatial_factor, W * spatial_factor, C)
+    return x
+
+
+def unpatchify_spatial(
+    x: mx.array,
+    patch_size: int,
+) -> mx.array:
+    """Reverse spatial patchification: depth-to-space for the final VAE output.
+
+    Matches the reference ``unpatchify`` from ltx-core ops.py:
+        ``"b (c p r q) f h w -> b c (f p) (h q) (w r)"``
+    with ``p=1, q=patch_size, r=patch_size``.
+
+    Channel split order: (c, p=1, r=width, q=height) — note r (width) comes
+    BEFORE q (height). This differs from ``pixel_shuffle_3d`` which uses
+    (c, temporal, height, width). Using ``pixel_shuffle_3d`` for unpatchify
+    swaps H/W sub-pixels and causes checkerboard artifacts.
+
+    Input:  (B, F, H, W, C * patch_size^2)   (BFHWC, temporal patch=1)
+    Output: (B, F, H*patch_size, W*patch_size, C)
+    """
+    B, F, H, W, C_total = x.shape
+    ps = patch_size
+    C = C_total // (ps * ps)
+    # Split channels as (C, r_width, q_height) matching reference (c, p=1, r, q)
+    x = x.reshape(B, F, H, W, C, ps, ps)
+    # Indices: B=0, F=1, H=2, W=3, C=4, r_W=5, q_H=6
+    # Target:  (B, F, H, q_H, W, r_W, C) -> (B, F, H*ps, W*ps, C)
+    x = x.transpose(0, 1, 2, 6, 3, 5, 4)
+    x = x.reshape(B, F, H * ps, W * ps, C)
     return x
 
 

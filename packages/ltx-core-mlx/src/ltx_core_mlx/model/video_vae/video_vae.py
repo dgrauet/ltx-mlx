@@ -41,6 +41,7 @@ from ltx_core_mlx.model.video_vae.sampling import (
     SpaceToDepthDownsample,
     patchify_spatial,
     pixel_shuffle_3d,
+    unpatchify_spatial,
 )
 from ltx_core_mlx.model.video_vae.tiling import (
     Tile,
@@ -211,8 +212,11 @@ class VideoDecoder(nn.Module):
         # Pre-activation PixelNorm + SiLU before final conv
         x = self.conv_out(nn.silu(pixel_norm(x)))
 
-        # Final spatial pixel shuffle: 48 -> 3 channels, 4x spatial expansion
-        x = pixel_shuffle_3d(x, spatial_factor=4, temporal_factor=1)
+        # Final spatial unpatchify: 48 -> 3 channels, 4x spatial expansion.
+        # Uses unpatchify_spatial (not pixel_shuffle_3d) because the reference
+        # unpatchify has channel order (c, p, r_W, q_H) — width factor before
+        # height factor — which differs from DepthToSpaceUpsample's (c, p1, p2_H, p3_W).
+        x = unpatchify_spatial(x, patch_size=4)
 
         # BFHWC -> BCFHW
         return x.transpose(0, 4, 1, 2, 3)

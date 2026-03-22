@@ -30,39 +30,86 @@ class HannSincResampler:
 
     Matches reference UpSample1d(ratio=3, window_type="hann").
     Not an nn.Module — no learnable parameters.
+
+    Reference implementation:
+        1. Replicate-pads input by ``width`` on each side
+        2. Applies conv_transpose1d(stride=ratio) with the sinc kernel
+        3. Scales by ratio and slices [pad_left:-pad_right]
+
+    MLX equivalent:
+        1. Replicate-pads input by ``width``
+        2. Zero-inserts (stride) between samples
+        3. Applies forward conv1d with the sinc kernel
+        4. Scales by ratio and slices to match reference output
     """
 
     def __init__(self, upsample_factor: int = 3):
         self.upsample_factor = upsample_factor
+        self._rolloff = 0.99
+        self._lowpass_filter_width = 6
+        self._width = int(np.ceil(self._lowpass_filter_width / self._rolloff))  # 7
         kernel = self._build_kernel(upsample_factor)
-        self.kernel = mx.array(kernel[:, None])  # (K, 1)
+        self.kernel = mx.array(kernel[:, None])  # (K, 1) for conv1d
+        # Padding/slicing params matching reference UpSample1d (Hann path)
+        self._pad = self._width  # replicate-pad on input: 7
+        self._kernel_size = 2 * self._width * upsample_factor + 1  # 43
+        self._pad_left = 2 * self._width * upsample_factor  # 42
+        self._pad_right = self._kernel_size - upsample_factor  # 40
 
-    @staticmethod
-    def _build_kernel(ratio: int) -> np.ndarray:
-        """Build Hann-windowed sinc filter matching reference."""
-        rolloff = 0.99
-        lowpass_filter_width = 6
-        width = int(np.ceil(lowpass_filter_width / rolloff))  # 7
-        idx = np.arange(-width * ratio, width * ratio + 1, dtype=np.float64)
-        t = idx / ratio
-        sinc = np.sinc(t * rolloff)
-        # Hann window: cos^2(t * pi / (2 * width))
-        window = np.cos(t * np.pi / (2 * width)) ** 2
-        kernel = (sinc * window).astype(np.float32)
-        kernel = kernel / kernel.sum() * ratio
+    def _build_kernel(self, ratio: int) -> np.ndarray:
+        """Build Hann-windowed sinc filter matching reference exactly.
+
+        Reference formula (UpSample1d, window_type="hann"):
+            time_axis = (arange(kernel_size) / ratio - width) * rolloff
+            time_clamped = clip(time_axis, -lpfw, lpfw)
+            window = cos(time_clamped * pi / lpfw / 2) ** 2
+            kernel = sinc(time_axis) * window * rolloff / ratio
+        """
+        kernel_size = 2 * self._width * ratio + 1  # 43
+        idx = np.arange(kernel_size, dtype=np.float64)
+        time_axis = (idx / ratio - self._width) * self._rolloff
+        time_clamped = np.clip(time_axis, -self._lowpass_filter_width, self._lowpass_filter_width)
+        window = np.cos(time_clamped * np.pi / self._lowpass_filter_width / 2) ** 2
+        kernel = (np.sinc(time_axis) * window * self._rolloff / ratio).astype(np.float32)
         return kernel
 
     def __call__(self, x: mx.array) -> mx.array:
-        """Upsample: (B, T) -> (B, T * factor)."""
+        """Upsample: (B, T) -> (B, T * factor).
+
+        Matches reference: replicate-pad -> conv_transpose1d -> scale -> slice.
+        Implemented as: replicate-pad -> zero-insert -> full conv1d -> scale -> slice.
+        """
         B, T = x.shape
-        upsampled = mx.zeros((B, T * self.upsample_factor))
-        upsampled = upsampled.at[:, :: self.upsample_factor].add(x)
-        upsampled = upsampled[:, :, None]
-        pad_len = self.kernel.shape[0] // 2
-        upsampled = mx.pad(upsampled, [(0, 0), (pad_len, pad_len), (0, 0)])
+        ratio = self.upsample_factor
+
+        # 1. Replicate-pad input (matches F.pad(x, (pad, pad), mode='replicate'))
+        first = mx.repeat(x[:, :1], self._pad, axis=1)  # (B, pad)
+        last = mx.repeat(x[:, -1:], self._pad, axis=1)  # (B, pad)
+        x_padded = mx.concatenate([first, x, last], axis=1)  # (B, T + 2*pad)
+        T_padded = x_padded.shape[1]
+
+        # 2. Zero-insert between samples (conv_transpose1d style):
+        #    output length = (T_padded - 1) * ratio + 1
+        zi_len = (T_padded - 1) * ratio + 1
+        upsampled = mx.zeros((B, zi_len))
+        upsampled = upsampled.at[:, ::ratio].add(x_padded)
+
+        # 3. Full convolution via zero-pad + valid conv1d
+        #    Full conv output = zi_len + K - 1
+        upsampled = upsampled[:, :, None]  # (B, zi_len, 1)
+        K = self.kernel.shape[0]
+        upsampled = mx.pad(upsampled, [(0, 0), (K - 1, K - 1), (0, 0)])
         filt = self.kernel[None, :, :]  # (1, K, 1)
         result = mx.conv1d(upsampled, filt, padding=0)
-        return result.squeeze(-1)[:, : T * self.upsample_factor]
+        result = result.squeeze(-1)  # (B, zi_len + K - 1)
+
+        # 4. Scale by ratio (matching reference: self.ratio * conv_transpose1d(...))
+        result = result * ratio
+
+        # 5. Slice to match reference output: [pad_left:-pad_right]
+        result = result[:, self._pad_left : -self._pad_right]
+
+        return result[:, : T * ratio]
 
 
 # ---------------------------------------------------------------------------
